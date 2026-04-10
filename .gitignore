@@ -12,3 +12,6 @@ ansible/sample*.cfg
 docker-compose.local.yml
 worker.local.cfg
 docs/.bundle
+
+# Local secrets (e.g. Girder API key for devops/dsa/utils/annotation_points.py)
+.env

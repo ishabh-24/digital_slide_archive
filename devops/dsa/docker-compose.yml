@@ -62,14 +62,15 @@ services:
       # For local development, uncomment the set of mounts associated with the
       # local source files.  Adding the editable egg directories first allows
       # mounting source files from the host without breaking the internal data.
-      # - /opt/HistomicsUI/histomicsui.egg-info
-      # - ../../../HistomicsUI:/opt/HistomicsUI
+      #- /opt/HistomicsUI/histomicsui.egg-info
+      #- ../../../HistomicsUI:/opt/HistomicsUI
 
       # See comments about authorizing docker repositories above
-      # - /home/<user directory>/.docker:/.docker:ro
+      #- /home/<user directory>/.docker:/.docker:ro
 
       # Add additional mounts here to get access to existing files on your
       # system.  Also add them to the worker container to reduce copying.
+      - /Users/ishabhatia/Desktop/penn-med-research/images:/data
     depends_on:
       - mongodb
       - memcached
