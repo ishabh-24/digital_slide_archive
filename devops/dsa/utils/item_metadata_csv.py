@@ -168,6 +168,19 @@ def _coerce_value(s: str) -> Any:
         return s
 
 
+def _detect_format(values: list[str]) -> str:
+    """Return 'number' if every non-empty value parses as float, else 'text'."""
+    clean = [v.strip() for v in values if v and v.strip()]
+    if not clean:
+        return 'text'
+    try:
+        for v in clean:
+            float(v)
+        return 'number'
+    except ValueError:
+        return 'text'
+
+
 def build_large_image_yaml_dict(metadata_keys: list[str]) -> dict[str, Any]:
     """
     Minimal itemList that shows thumbnails, name, and metadata columns with
@@ -248,6 +261,127 @@ def cmd_set_folder_filter_meta(client: Any, args: argparse.Namespace) -> None:
     print("Set folder metadata key %r on folder %s" % (key, args.folder_id))
 
 
+def cmd_ingest_csv(client: Any, args: argparse.Namespace) -> None:
+    """One-shot: apply CSV metadata + auto-generate and upload filter YAML."""
+    skip = set(args.skip_columns or []) | {"item_id", "_id", "name", "item_name"}
+    with open(args.csv, encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            print("CSV has no header row.", file=sys.stderr)
+            sys.exit(1)
+        rows = list(reader)
+        meta_keys = [
+            k.strip() for k in reader.fieldnames
+            if k and k.strip() not in skip and "." not in k.strip()
+        ]
+
+    # Collect values for format detection
+    values_by_key: dict[str, list[str]] = {k: [] for k in meta_keys}
+    for row in rows:
+        for k in meta_keys:
+            v = (row.get(k) or "").strip()
+            if v:
+                values_by_key[k].append(v)
+
+    format_map = {k: _detect_format(values_by_key[k]) for k in meta_keys}
+
+    # Apply metadata to items
+    items = list(client.listItem(args.folder_id))
+    name_to_id = {it["name"]: str(it["_id"]) for it in items}
+    id_set = {str(it["_id"]) for it in items}
+
+    updated = 0
+    errors: list[str] = []
+
+    for i, row in enumerate(rows, start=2):
+        if args.match_on == "item_id":
+            item_id = (row.get("item_id") or row.get("_id") or "").strip()
+            if not item_id or item_id not in id_set:
+                errors.append("line %d: item id not found: %r" % (i, item_id))
+                continue
+        else:
+            name = (row.get("name") or row.get("item_name") or "").strip()
+            item_id = name_to_id.get(name)
+            if not item_id:
+                errors.append("line %d: no item named %r" % (i, name))
+                continue
+
+        meta: dict[str, Any] = {}
+        for k in meta_keys:
+            v = (row.get(k) or "").strip()
+            if not v:
+                continue
+            if format_map[k] == "number":
+                try:
+                    meta[k] = float(v) if "." in v else int(v)
+                except ValueError:
+                    meta[k] = v
+            else:
+                meta[k] = _coerce_value(v)
+        if meta:
+            try:
+                _item_metadata_put(client, item_id, meta)
+                updated += 1
+            except Exception as ex:
+                errors.append("line %d: item %s: %s" % (i, item_id, ex))
+
+    print("Updated metadata on %d item(s)." % updated)
+
+    # Generate and upload .large_image_config.yaml
+    yaml_dict = build_large_image_yaml_dict_with_formats(meta_keys, format_map)
+    try:
+        import yaml  # type: ignore[import-not-found]
+    except ImportError:
+        print("Install PyYAML to upload filter config: pip install pyyaml", file=sys.stderr)
+        yaml = None  # type: ignore[assignment]
+
+    if yaml is not None:
+        yaml_content = yaml.safe_dump(yaml_dict, sort_keys=False, default_flow_style=False)
+        import tempfile, os as _os
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8") as tf:
+            tf.write(yaml_content)
+            tmp_path = tf.name
+        try:
+            upload = getattr(client, "uploadFileToFolder", None)
+            if upload is None:
+                print("girder_client.uploadFileToFolder not available; skipping YAML upload.", file=sys.stderr)
+            else:
+                upload(args.folder_id, tmp_path, filename=".large_image_config.yaml", mimeType="text/yaml")
+                print("Uploaded .large_image_config.yaml with columns: %s" % ", ".join(meta_keys))
+                print("Formats: %s" % ", ".join("%s=%s" % (k, v) for k, v in format_map.items()))
+        finally:
+            _os.unlink(tmp_path)
+
+    if errors:
+        print("\nWarnings / errors:", file=sys.stderr)
+        for e in errors[:50]:
+            print("  %s" % e, file=sys.stderr)
+        if len(errors) > 50:
+            print("  ... and %d more" % (len(errors) - 50), file=sys.stderr)
+
+
+def build_large_image_yaml_dict_with_formats(
+    metadata_keys: list[str], format_map: dict[str, str]
+) -> dict[str, Any]:
+    """Like build_large_image_yaml_dict but uses per-column formats from detection."""
+    columns: list[dict[str, Any]] = [
+        {"type": "image", "value": "thumbnail", "title": "Thumbnail", "width": 160, "height": 100},
+        {"type": "record", "value": "name", "title": "Name"},
+        {"type": "record", "value": "size", "title": "Size"},
+    ]
+    for key in metadata_keys:
+        key = key.strip()
+        if not key:
+            continue
+        columns.append({
+            "type": "metadata",
+            "value": key,
+            "title": key.replace("_", " ").title(),
+            "format": format_map.get(key, "text"),
+        })
+    return {"itemList": {"layout": {"mode": "grid", "flatten": False}, "columns": columns}}
+
+
 def main() -> None:
     _load_dotenv()
     p = argparse.ArgumentParser(description="CSV → item metadata; large_image YAML for Histomics item list.")
@@ -292,6 +426,25 @@ def main() -> None:
     u.add_argument("--folder-id", required=True)
     u.add_argument("--yaml", required=True, help="Path to YAML file")
     u.set_defaults(func=cmd_upload_large_image_yaml)
+
+    ic = sub.add_parser(
+        "ingest-csv",
+        help="One-shot: apply CSV metadata to items AND upload filter YAML (combines apply-csv + write/upload YAML)",
+    )
+    ic.add_argument("--folder-id", required=True, help="Folder containing slide items")
+    ic.add_argument("--csv", required=True, help="CSV path")
+    ic.add_argument(
+        "--match-on",
+        choices=("item_id", "name"),
+        default="name",
+        help="Match rows to items by name (default) or item_id column",
+    )
+    ic.add_argument(
+        "--skip-columns",
+        default=None,
+        help="Comma-separated extra columns to exclude from metadata",
+    )
+    ic.set_defaults(func=cmd_ingest_csv)
 
     s = sub.add_parser(
         "set-folder-filter-meta",

@@ -10,7 +10,9 @@ ansible/roles/girder.girder
 ansible/roles/girder.mongodb
 ansible/sample*.cfg
 docker-compose.local.yml
+devops/dsa/docker-compose.override.yml
 worker.local.cfg
+.vscode/
 docs/.bundle
 
 # Local secrets (e.g. Girder API key for devops/dsa/utils/annotation_points.py)

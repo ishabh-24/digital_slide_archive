@@ -147,6 +147,10 @@ RUN echo 'task_acks_late = True' >> /opt/girder_worker/girder_worker/celeryconfi
 
 COPY . /opt/digital_slide_archive
 
+# Install local DSA CSV plugin (pure-Python, no girder build required)
+RUN pip install --no-cache-dir -e /opt/digital_slide_archive/devops/dsa/dsa_csv_plugin && \
+    find / -xdev -type d -name __pycache__ -exec rm -r {} \+
+
 ENV PATH="/opt/digital_slide_archive/devops/dsa/utils:$PATH"
 
 WORKDIR /opt/HistomicsUI
