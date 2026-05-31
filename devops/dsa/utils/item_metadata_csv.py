@@ -168,53 +168,95 @@ def _coerce_value(s: str) -> Any:
         return s
 
 
-def _detect_format(values: list[str]) -> str:
-    """Return 'number' if every non-empty value parses as float, else 'text'."""
+def _sort_enum_key(value: Any) -> tuple[int, float | str]:
+    if isinstance(value, bool):
+        return (0, float(value))
+    if isinstance(value, (int, float)):
+        return (0, float(value))
+    if isinstance(value, str):
+        try:
+            return (0, float(value))
+        except ValueError:
+            return (1, value.lower())
+    return (1, str(value).lower())
+
+
+def _metadata_filter_spec(values: list[str]) -> dict[str, Any]:
+    """
+    Build large_image column filter settings for one metadata key.
+
+    Uses format ``category`` with a dynamic ``enum`` of distinct values so the
+    item list shows a dropdown (multi-select) instead of only up/down sorting.
+    See: https://girder.github.io/large_image/girder_config_options.html
+    """
     clean = [v.strip() for v in values if v and v.strip()]
     if not clean:
-        return 'text'
-    try:
-        for v in clean:
-            float(v)
-        return 'number'
-    except ValueError:
-        return 'text'
+        return {"format": "text"}
+    unique = sorted({_coerce_value(v) for v in clean}, key=_sort_enum_key)
+    return {"format": "category", "enum": unique}
 
 
-def build_large_image_yaml_dict(metadata_keys: list[str]) -> dict[str, Any]:
-    """
-    Minimal itemList that shows thumbnails, name, and metadata columns with
-    text/category-style filtering (see large_image docs: format field).
-    """
-    columns: list[dict[str, Any]] = [
+def _base_columns() -> list[dict[str, Any]]:
+    return [
         {"type": "image", "value": "thumbnail", "title": "Thumbnail", "width": 160, "height": 100},
         {"type": "record", "value": "name", "title": "Name"},
         {"type": "record", "value": "size", "title": "Size"},
     ]
+
+
+def _metadata_column(key: str, filter_spec: dict[str, Any] | None = None) -> dict[str, Any]:
+    spec = filter_spec or {"format": "text"}
+    col: dict[str, Any] = {
+        "type": "metadata",
+        "value": key,
+        "title": key.replace("_", " ").title(),
+        "format": spec.get("format", "text"),
+    }
+    if spec.get("enum"):
+        col["enum"] = spec["enum"]
+    return col
+
+
+def build_large_image_yaml_dict(
+    metadata_keys: list[str],
+    filter_specs: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build itemList YAML with optional per-column category filter specs."""
+    specs = filter_specs or {}
+    columns = list(_base_columns())
     for key in metadata_keys:
         key = key.strip()
         if not key:
             continue
-        columns.append(
-            {
-                "type": "metadata",
-                "value": key,
-                "title": key.replace("_", " ").title(),
-                "format": "text",
-            }
-        )
+        columns.append(_metadata_column(key, specs.get(key)))
     return {
         "itemList": {
             "layout": {"mode": "grid", "flatten": False},
             "columns": columns,
-        }
+        },
+        "itemListDialog": {
+            "columns": columns,
+        },
     }
 
 
 def cmd_write_large_image_yaml(client: Any, args: argparse.Namespace) -> None:
     del client  # unused
     keys = [k.strip() for k in args.keys.split(",") if k.strip()]
-    data = build_large_image_yaml_dict(keys)
+    filter_specs: dict[str, dict[str, Any]] | None = None
+    if args.csv:
+        skip = set(args.skip_columns or []) | {"item_id", "_id", "name", "item_name"}
+        with open(args.csv, encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+        values_by_key = {k: [] for k in keys}
+        for row in rows:
+            for k in keys:
+                v = (row.get(k) or "").strip()
+                if v:
+                    values_by_key[k].append(v)
+        filter_specs = {k: _metadata_filter_spec(values_by_key[k]) for k in keys}
+    data = build_large_image_yaml_dict(keys, filter_specs)
     try:
         import yaml  # type: ignore[import-not-found]
     except ImportError:
@@ -223,6 +265,62 @@ def cmd_write_large_image_yaml(client: Any, args: argparse.Namespace) -> None:
     out = yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
     Path(args.output).write_text(out, encoding="utf-8")
     print("Wrote %s" % args.output)
+
+
+def cmd_configure_filters(client: Any, args: argparse.Namespace) -> None:
+    """Rebuild .large_image_config.yaml category dropdowns from item metadata in a folder."""
+    keys = [k.strip() for k in args.keys.split(",") if k.strip()]
+    items = _list_folder_items(client, args.folder_id)
+    values_by_key: dict[str, list[str]] = {k: [] for k in keys}
+    for it in items:
+        meta = it.get("meta") or {}
+        for k in keys:
+            if k in meta and meta[k] is not None and str(meta[k]).strip() != "":
+                values_by_key[k].append(str(meta[k]))
+
+    filter_specs = {k: _metadata_filter_spec(values_by_key[k]) for k in keys}
+    yaml_dict = build_large_image_yaml_dict(keys, filter_specs)
+
+    try:
+        import yaml  # type: ignore[import-not-found]
+    except ImportError:
+        print("Install PyYAML: pip install pyyaml", file=sys.stderr)
+        sys.exit(1)
+
+    if args.output:
+        Path(args.output).write_text(
+            yaml.safe_dump(yaml_dict, sort_keys=False, default_flow_style=False),
+            encoding="utf-8",
+        )
+        print("Wrote %s" % args.output)
+
+    if not args.no_upload:
+        import tempfile
+        import os as _os
+
+        content = yaml.safe_dump(yaml_dict, sort_keys=False, default_flow_style=False)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8") as tf:
+            tf.write(content)
+            tmp_path = tf.name
+        try:
+            upload = getattr(client, "uploadFileToFolder", None)
+            if upload is None:
+                print("girder_client.uploadFileToFolder not available", file=sys.stderr)
+                sys.exit(1)
+            upload(
+                args.folder_id,
+                tmp_path,
+                filename=".large_image_config.yaml",
+                mimeType="text/yaml",
+            )
+            print("Uploaded .large_image_config.yaml to folder %s" % args.folder_id)
+        finally:
+            _os.unlink(tmp_path)
+
+    for k in keys:
+        spec = filter_specs[k]
+        enum = spec.get("enum") or []
+        print("  %s: %s (%d filter values)" % (k, spec.get("format", "text"), len(enum)))
 
 
 def cmd_upload_large_image_yaml(client: Any, args: argparse.Namespace) -> None:
@@ -275,20 +373,11 @@ def cmd_ingest_csv(client: Any, args: argparse.Namespace) -> None:
             if k and k.strip() not in skip and "." not in k.strip()
         ]
 
-    # Collect values for format detection
-    values_by_key: dict[str, list[str]] = {k: [] for k in meta_keys}
-    for row in rows:
-        for k in meta_keys:
-            v = (row.get(k) or "").strip()
-            if v:
-                values_by_key[k].append(v)
-
-    format_map = {k: _detect_format(values_by_key[k]) for k in meta_keys}
-
-    # Apply metadata to items
+    # Apply metadata to items; collect values from matched rows for filter enums
     items = list(client.listItem(args.folder_id))
     name_to_id = {it["name"]: str(it["_id"]) for it in items}
     id_set = {str(it["_id"]) for it in items}
+    values_by_key: dict[str, list[str]] = {k: [] for k in meta_keys}
 
     updated = 0
     errors: list[str] = []
@@ -311,13 +400,8 @@ def cmd_ingest_csv(client: Any, args: argparse.Namespace) -> None:
             v = (row.get(k) or "").strip()
             if not v:
                 continue
-            if format_map[k] == "number":
-                try:
-                    meta[k] = float(v) if "." in v else int(v)
-                except ValueError:
-                    meta[k] = v
-            else:
-                meta[k] = _coerce_value(v)
+            meta[k] = _coerce_value(v)
+            values_by_key[k].append(v)
         if meta:
             try:
                 _item_metadata_put(client, item_id, meta)
@@ -327,8 +411,10 @@ def cmd_ingest_csv(client: Any, args: argparse.Namespace) -> None:
 
     print("Updated metadata on %d item(s)." % updated)
 
+    filter_specs = {k: _metadata_filter_spec(values_by_key[k]) for k in meta_keys}
+
     # Generate and upload .large_image_config.yaml
-    yaml_dict = build_large_image_yaml_dict_with_formats(meta_keys, format_map)
+    yaml_dict = build_large_image_yaml_dict(meta_keys, filter_specs)
     try:
         import yaml  # type: ignore[import-not-found]
     except ImportError:
@@ -348,7 +434,10 @@ def cmd_ingest_csv(client: Any, args: argparse.Namespace) -> None:
             else:
                 upload(args.folder_id, tmp_path, filename=".large_image_config.yaml", mimeType="text/yaml")
                 print("Uploaded .large_image_config.yaml with columns: %s" % ", ".join(meta_keys))
-                print("Formats: %s" % ", ".join("%s=%s" % (k, v) for k, v in format_map.items()))
+                for k in meta_keys:
+                    spec = filter_specs[k]
+                    enum = spec.get("enum") or []
+                    print("  %s: %s (%d filter values)" % (k, spec.get("format", "text"), len(enum)))
         finally:
             _os.unlink(tmp_path)
 
@@ -358,28 +447,6 @@ def cmd_ingest_csv(client: Any, args: argparse.Namespace) -> None:
             print("  %s" % e, file=sys.stderr)
         if len(errors) > 50:
             print("  ... and %d more" % (len(errors) - 50), file=sys.stderr)
-
-
-def build_large_image_yaml_dict_with_formats(
-    metadata_keys: list[str], format_map: dict[str, str]
-) -> dict[str, Any]:
-    """Like build_large_image_yaml_dict but uses per-column formats from detection."""
-    columns: list[dict[str, Any]] = [
-        {"type": "image", "value": "thumbnail", "title": "Thumbnail", "width": 160, "height": 100},
-        {"type": "record", "value": "name", "title": "Name"},
-        {"type": "record", "value": "size", "title": "Size"},
-    ]
-    for key in metadata_keys:
-        key = key.strip()
-        if not key:
-            continue
-        columns.append({
-            "type": "metadata",
-            "value": key,
-            "title": key.replace("_", " ").title(),
-            "format": format_map.get(key, "text"),
-        })
-    return {"itemList": {"layout": {"mode": "grid", "flatten": False}, "columns": columns}}
 
 
 def main() -> None:
@@ -416,8 +483,37 @@ def main() -> None:
         help="Write .large_image_config.yaml listing metadata keys as columns (use with upload-large-image-yaml)",
     )
     w.add_argument("--keys", required=True, help="Comma-separated meta keys, e.g. stain,cohort")
+    w.add_argument("--csv", help="Optional CSV to derive category enum values from")
+    w.add_argument(
+        "--skip-columns",
+        default=None,
+        help="Comma-separated CSV columns to skip when reading --csv",
+    )
     w.add_argument("-o", "--output", default=".large_image_config.yaml")
     w.set_defaults(func=cmd_write_large_image_yaml)
+
+    cf = sub.add_parser(
+        "configure-filters",
+        help="Build category dropdown filters from existing item metadata and upload YAML",
+    )
+    cf.add_argument("--folder-id", required=True)
+    cf.add_argument(
+        "--keys",
+        required=True,
+        help="Comma-separated metadata keys to expose as filter dropdowns",
+    )
+    cf.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="Optional local path to write YAML",
+    )
+    cf.add_argument(
+        "--no-upload",
+        action="store_true",
+        help="Only write local YAML; do not upload to folder",
+    )
+    cf.set_defaults(func=cmd_configure_filters)
 
     u = sub.add_parser(
         "upload-large-image-yaml",
@@ -462,10 +558,13 @@ def main() -> None:
     s.set_defaults(func=cmd_set_folder_filter_meta)
 
     args = p.parse_args()
-    if getattr(args, "skip_columns", None):
+    if getattr(args, "skip_columns", None) and isinstance(args.skip_columns, str):
         args.skip_columns = [c.strip() for c in args.skip_columns.split(",") if c.strip()]
-    client = connect(args.api_url, args.api_key, args.username, args.password)
-    args.func(client, args)
+    if args.command == "write-large-image-yaml":
+        args.func(None, args)
+    else:
+        client = connect(args.api_url, args.api_key, args.username, args.password)
+        args.func(client, args)
 
 
 if __name__ == "__main__":

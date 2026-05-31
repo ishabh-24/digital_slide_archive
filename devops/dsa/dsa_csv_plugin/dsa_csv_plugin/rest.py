@@ -17,33 +17,71 @@ from girder.models.upload import Upload
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _detect_format(values):
-    """Return 'number' if every non-empty value is numeric, else 'text'."""
-    clean = [v.strip() for v in values if v and str(v).strip()]
-    if not clean:
-        return 'text'
+def _coerce_value(s):
+    if isinstance(s, bool):
+        return s
+    if s.lower() in ('true', 'false'):
+        return s.lower() == 'true'
     try:
-        for v in clean:
-            float(v)
-        return 'number'
-    except (ValueError, TypeError):
-        return 'text'
+        if '.' in s:
+            return float(s)
+        return int(s)
+    except (ValueError, AttributeError):
+        return s
 
 
-def _build_yaml_dict(meta_keys, format_map):
-    columns = [
+def _sort_enum_key(value):
+    if isinstance(value, bool):
+        return (0, float(value))
+    if isinstance(value, (int, float)):
+        return (0, float(value))
+    if isinstance(value, str):
+        try:
+            return (0, float(value))
+        except ValueError:
+            return (1, value.lower())
+    return (1, str(value).lower())
+
+
+def _metadata_filter_spec(values):
+    """Category dropdown with dynamic enum of distinct values for this column."""
+    clean = [str(v).strip() for v in values if v is not None and str(v).strip()]
+    if not clean:
+        return {'format': 'text'}
+    unique = sorted({_coerce_value(v) for v in clean}, key=_sort_enum_key)
+    return {'format': 'category', 'enum': unique}
+
+
+def _base_columns():
+    return [
         {'type': 'image', 'value': 'thumbnail', 'title': 'Thumbnail', 'width': 160, 'height': 100},
         {'type': 'record', 'value': 'name', 'title': 'Name'},
         {'type': 'record', 'value': 'size', 'title': 'Size'},
     ]
+
+
+def _metadata_column(key, filter_spec=None):
+    spec = filter_spec or {'format': 'text'}
+    col = {
+        'type': 'metadata',
+        'value': key,
+        'title': key.replace('_', ' ').title(),
+        'format': spec.get('format', 'text'),
+    }
+    if spec.get('enum'):
+        col['enum'] = spec['enum']
+    return col
+
+
+def _build_yaml_dict(meta_keys, filter_specs=None):
+    specs = filter_specs or {}
+    columns = list(_base_columns())
     for key in meta_keys:
-        columns.append({
-            'type': 'metadata',
-            'value': key,
-            'title': key.replace('_', ' ').title(),
-            'format': format_map.get(key, 'text'),
-        })
-    return {'itemList': {'layout': {'mode': 'grid', 'flatten': False}, 'columns': columns}}
+        columns.append(_metadata_column(key, specs.get(key)))
+    return {
+        'itemList': {'layout': {'mode': 'grid', 'flatten': False}, 'columns': columns},
+        'itemListDialog': {'columns': columns},
+    }
 
 
 def _upload_config_yaml(folder, yaml_dict, user):
@@ -82,6 +120,44 @@ class DsaCsvResource(Resource):
         super().__init__()
         self.resourceName = 'dsa_tools'
         self.route('POST', ('folder', ':folderId', 'ingest_csv'), self.ingest_csv)
+        self.route('GET', ('folder', ':folderId', 'slide_meta'), self.slide_meta)
+
+    @access.public
+    @autoDescribeRoute(
+        Description('List items in a folder with their metadata, plus the sorted '
+                    'distinct values for each metadata key. Used to build the '
+                    'filter dropdowns on the Browse & Filter page.')
+        .modelParam('folderId', 'Target folder', model=Folder,
+                    level=AccessType.READ, paramType='path')
+    )
+    def slide_meta(self, folder, params):
+        items = list(Item().find({'folderId': folder['_id']}))
+        out_items = []
+        categories = {}
+        for it in items:
+            name = it.get('name', '')
+            if name == '.large_image_config.yaml':
+                continue
+            meta = it.get('meta', {}) or {}
+            flat_meta = {}
+            for k, v in meta.items():
+                if v is None or (isinstance(v, str) and not v.strip()):
+                    continue
+                if isinstance(v, (dict, list)):
+                    continue
+                flat_meta[k] = v
+                categories.setdefault(k, set()).add(v)
+            out_items.append({
+                '_id': str(it['_id']),
+                'name': name,
+                'largeImage': bool(it.get('largeImage')),
+                'meta': flat_meta,
+            })
+        cats = {
+            k: sorted(vals, key=_sort_enum_key)
+            for k, vals in categories.items()
+        }
+        return {'items': out_items, 'categories': cats}
 
     @access.user
     @autoDescribeRoute(
@@ -111,15 +187,8 @@ class DsaCsvResource(Resource):
         ]
         rows = list(reader)
 
-        # Collect all values per key for format detection
+        # Collect values from matched rows for category filter enums
         values_by_key = {k: [] for k in meta_keys}
-        for row in rows:
-            for k in meta_keys:
-                v = (row.get(k) or '').strip()
-                if v:
-                    values_by_key[k].append(v)
-
-        format_map = {k: _detect_format(values_by_key[k]) for k in meta_keys}
 
         # Build lookup indexes once
         items = list(Item().find({'folderId': folder['_id']}))
@@ -149,20 +218,17 @@ class DsaCsvResource(Resource):
                 v = (row.get(k) or '').strip()
                 if not v:
                     continue
-                if format_map[k] == 'number':
-                    try:
-                        meta[k] = float(v) if '.' in v else int(v)
-                    except ValueError:
-                        meta[k] = v
-                else:
-                    meta[k] = v
+                meta[k] = _coerce_value(v)
+                values_by_key[k].append(v)
 
             if meta:
                 Item().setMetadata(item_doc, meta)
                 updated += 1
 
+        filter_specs = {k: _metadata_filter_spec(values_by_key[k]) for k in meta_keys}
+
         # Generate and upload filter config YAML
-        yaml_dict = _build_yaml_dict(meta_keys, format_map)
+        yaml_dict = _build_yaml_dict(meta_keys, filter_specs)
         yaml_uploaded = False
         yaml_error = None
         try:
@@ -175,7 +241,7 @@ class DsaCsvResource(Resource):
             'items_updated': updated,
             'items_not_found': not_found[:50],
             'columns_configured': meta_keys,
-            'format_map': format_map,
+            'filter_specs': filter_specs,
             'yaml_uploaded': yaml_uploaded,
         }
         if yaml_error:
@@ -189,6 +255,10 @@ class DsaCsvResource(Resource):
 
 def get_upload_html():
     return _HTML
+
+
+def get_filter_html():
+    return _FILTER_HTML
 
 
 _HTML = """<!DOCTYPE html>
@@ -227,6 +297,8 @@ button{padding:9px 22px;border:none;border-radius:4px;font-size:.95em;cursor:poi
 .tag{display:inline-block;background:#ebf5fb;color:#2471a3;border-radius:3px;
      padding:2px 7px;margin:2px;font-size:.8em;font-family:monospace}
 .tag.number{background:#eafaf1;color:#1e8449}
+.biglink{display:inline-block;font-weight:600;color:#2980b9;text-decoration:none}
+.biglink:hover{text-decoration:underline}
 details{margin-top:10px}
 summary{cursor:pointer;font-size:.85em;color:#555}
 pre{background:#f8f9fa;padding:10px;border-radius:4px;font-size:.8em;
@@ -371,15 +443,21 @@ pre{background:#f8f9fa;padding:10px;border-radius:4px;font-size:.8em;
     if (data.columns_configured && data.columns_configured.length) {
       html += '<br><br>Filter columns now available in HistomicsUI:<br>';
       data.columns_configured.forEach(function(col) {
-        var fmt = data.format_map && data.format_map[col];
-        html += '<span class="tag' + (fmt === 'number' ? ' number' : '') + '">' +
-                esc(col) + (fmt ? ' — ' + fmt : '') + '</span>';
+        var spec = data.filter_specs && data.filter_specs[col];
+        var fmt = spec && spec.format;
+        var count = spec && spec.enum ? spec.enum.length : 0;
+        html += '<span class="tag' + (fmt === 'category' ? ' number' : '') + '">' +
+                esc(col) + (fmt ? ' — ' + fmt : '') +
+                (count ? ' (' + count + ' values)' : '') + '</span>';
       });
     }
 
     if (data.yaml_uploaded) {
       html += '<br><br>✓ <em>.large_image_config.yaml</em> uploaded. ' +
-              'Open the folder in HistomicsUI to see the new filter fields.';
+              'Open the folder in HistomicsUI to see the new filter columns.';
+      var folderId = document.getElementById('folderId').value.trim();
+      html += '<br><br><a class="biglink" href="/slidefilter?folderId=' +
+              encodeURIComponent(folderId) + '">▶ Browse &amp; filter these slides by category →</a>';
     } else if (data.yaml_error) {
       html += '<br><br>⚠️ YAML upload failed: ' + esc(data.yaml_error);
     }
@@ -400,6 +478,274 @@ pre{background:#f8f9fa;padding:10px;border-radius:4px;font-size:.8em;
       .replace(/&/g,'&amp;').replace(/</g,'&lt;')
       .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
+})();
+</script>
+</body>
+</html>"""
+
+
+_FILTER_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DSA &mdash; Browse &amp; Filter Slides</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+     background:#f0f2f5;color:#333;padding:24px 16px}
+.wrap{max-width:1100px;margin:0 auto}
+h1{font-size:1.35em;color:#1a3a5c;border-bottom:3px solid #3498db;
+   padding-bottom:10px;margin-bottom:18px}
+.card{background:#fff;border-radius:8px;padding:20px;margin-bottom:16px;
+      box-shadow:0 1px 4px rgba(0,0,0,.08)}
+h2{font-size:.9em;text-transform:uppercase;letter-spacing:.05em;
+   color:#7f8c8d;margin-bottom:12px}
+label{display:block;font-size:.8em;font-weight:600;color:#555;margin-bottom:4px}
+input,select{width:100%;padding:8px 10px;border:1px solid #d1d5db;border-radius:4px;
+             font-size:.92em;transition:border .15s}
+input:focus,select:focus{outline:none;border-color:#3498db}
+.conn{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.row{display:flex;gap:10px;align-items:flex-end;margin-top:10px}
+.row>div{flex:1}
+.hint{font-size:.78em;color:#9b59b6;margin-top:6px}
+button{padding:9px 18px;border:none;border-radius:4px;font-size:.92em;cursor:pointer}
+.btn-primary{background:#3498db;color:#fff;white-space:nowrap}
+.btn-primary:hover{background:#2980b9}
+.btn-ghost{background:#ecf0f1;color:#333}
+.btn-ghost:hover{background:#d5dbdb}
+#filtersCard{display:none}
+.filters{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px}
+.count{font-size:.85em;color:#555;margin:4px 0 14px}
+.count b{color:#1a3a5c}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:16px}
+.slide{background:#fff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;
+       transition:box-shadow .15s,transform .15s;text-decoration:none;color:inherit;display:block}
+.slide:hover{box-shadow:0 4px 14px rgba(0,0,0,.13);transform:translateY(-2px)}
+.thumb{width:100%;height:140px;background:#eef1f4;display:flex;align-items:center;
+       justify-content:center;color:#aab;font-size:.8em;overflow:hidden}
+.thumb img{width:100%;height:100%;object-fit:cover}
+.slide .body{padding:10px}
+.slide .nm{font-size:.85em;font-weight:600;word-break:break-all;margin-bottom:6px}
+.chip{display:inline-block;background:#ebf5fb;color:#2471a3;border-radius:3px;
+      padding:1px 6px;margin:2px 2px 0 0;font-size:.72em}
+.err{background:#fdedec;border:1px solid #f5b7b1;border-radius:4px;padding:14px;color:#922b21}
+.empty{padding:40px;text-align:center;color:#999}
+.topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.topbar a{font-size:.82em;color:#2980b9;text-decoration:none}
+.topbar a:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <h1 style="border:none;margin:0;padding:0">DSA &mdash; Browse &amp; Filter Slides</h1>
+    <a href="/csv_upload">↩ Back to CSV import</a>
+  </div>
+
+  <div class="card">
+    <h2>Connection &amp; Folder</h2>
+    <div class="conn">
+      <div>
+        <label for="apiUrl">Girder API URL</label>
+        <input id="apiUrl" type="text">
+      </div>
+      <div>
+        <label for="apiKey">API Key (optional for public folders)</label>
+        <input id="apiKey" type="password" placeholder="Paste API key">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="folderPath">Folder path</label>
+        <input id="folderPath" type="text" placeholder="/collection/My Collection/Images">
+      </div>
+      <button class="btn-ghost" type="button" onclick="lookupFolder()">Look up ID</button>
+    </div>
+    <div class="row">
+      <div>
+        <label for="folderId">Folder ID</label>
+        <input id="folderId" type="text" placeholder="5f3a1b2c3d4e5f6a7b8c9d0e">
+      </div>
+      <button class="btn-primary" type="button" onclick="loadSlides()">Load slides</button>
+    </div>
+    <p class="hint" id="hint">&nbsp;</p>
+  </div>
+
+  <div class="card" id="filtersCard">
+    <h2>Filter by metadata category</h2>
+    <div class="filters" id="filters"></div>
+    <div style="margin-top:14px">
+      <button class="btn-ghost" type="button" onclick="clearFilters()">Clear all filters</button>
+    </div>
+  </div>
+
+  <div id="resultsArea"></div>
+</div>
+
+<script>
+(function(){
+  var STATE = {items: [], categories: {}, token: '', apiUrl: ''};
+
+  document.getElementById('apiUrl').value = window.location.origin + '/api/v1';
+
+  // Pre-fill folderId from ?folderId= query param (linked from the import page)
+  var qs = new URLSearchParams(window.location.search);
+  if (qs.get('folderId')) document.getElementById('folderId').value = qs.get('folderId');
+
+  async function getToken(apiUrl, apiKey) {
+    if (!apiKey) return '';
+    var r = await fetch(
+      apiUrl + '/api_key/token?key=' + encodeURIComponent(apiKey) + '&duration=1',
+      {method:'POST'});
+    if (!r.ok) throw new Error('Auth failed: ' + await r.text());
+    return (await r.json()).authToken.token;
+  }
+
+  window.lookupFolder = async function() {
+    var apiUrl = document.getElementById('apiUrl').value.trim();
+    var apiKey = document.getElementById('apiKey').value.trim();
+    var path   = document.getElementById('folderPath').value.trim();
+    var hint   = document.getElementById('hint');
+    if (!path) { hint.textContent = 'Enter a path first.'; return; }
+    try {
+      var headers = {};
+      var tok = await getToken(apiUrl, apiKey);
+      if (tok) headers['Girder-Token'] = tok;
+      var r = await fetch(apiUrl + '/resource/lookup?path=' + encodeURIComponent(path),
+                          {headers:headers});
+      if (!r.ok) throw new Error(await r.text());
+      var doc = await r.json();
+      document.getElementById('folderId').value = doc._id;
+      hint.textContent = 'Found: ' + doc.name;
+    } catch(e) { hint.textContent = 'Error: ' + e.message; }
+  };
+
+  window.loadSlides = async function() {
+    var apiUrl   = document.getElementById('apiUrl').value.trim();
+    var apiKey   = document.getElementById('apiKey').value.trim();
+    var folderId = document.getElementById('folderId').value.trim();
+    var hint     = document.getElementById('hint');
+    var results  = document.getElementById('resultsArea');
+    if (!folderId) { hint.textContent = 'Folder ID required.'; return; }
+    hint.textContent = 'Loading…';
+    try {
+      STATE.token  = await getToken(apiUrl, apiKey);
+      STATE.apiUrl = apiUrl;
+      var headers = {};
+      if (STATE.token) headers['Girder-Token'] = STATE.token;
+      var r = await fetch(apiUrl + '/dsa_tools/folder/' + folderId + '/slide_meta',
+                          {headers:headers});
+      if (!r.ok) throw new Error(await r.text());
+      var data = await r.json();
+      STATE.items = data.items || [];
+      STATE.categories = data.categories || {};
+      hint.textContent = '';
+      buildFilters();
+      applyFilters();
+    } catch(e) {
+      results.innerHTML = '<div class="card"><div class="err">Error: ' +
+                          esc(e.message) + '</div></div>';
+    }
+  };
+
+  function buildFilters() {
+    var wrap = document.getElementById('filters');
+    var keys = Object.keys(STATE.categories).sort();
+    if (!keys.length) {
+      document.getElementById('filtersCard').style.display = 'none';
+      return;
+    }
+    document.getElementById('filtersCard').style.display = 'block';
+    wrap.innerHTML = '';
+    keys.forEach(function(key) {
+      var values = STATE.categories[key] || [];
+      var div = document.createElement('div');
+      var html = '<label>' + esc(prettify(key)) +
+                 ' <span style="color:#aaa;font-weight:400">(' + values.length + ')</span></label>';
+      html += '<select data-key="' + esc(key) + '" onchange="applyFilters()">';
+      html += '<option value="__any__">— Any —</option>';
+      values.forEach(function(v) {
+        html += '<option value="' + esc(String(v)) + '">' + esc(String(v)) + '</option>';
+      });
+      html += '</select>';
+      div.innerHTML = html;
+      wrap.appendChild(div);
+    });
+  }
+
+  window.clearFilters = function() {
+    document.querySelectorAll('#filters select').forEach(function(s){ s.value = '__any__'; });
+    applyFilters();
+  };
+
+  function selectedFilters() {
+    var sel = {};
+    document.querySelectorAll('#filters select').forEach(function(s) {
+      if (s.value !== '__any__') sel[s.getAttribute('data-key')] = s.value;
+    });
+    return sel;
+  }
+
+  window.applyFilters = function() {
+    var sel = selectedFilters();
+    var matches = STATE.items.filter(function(it) {
+      for (var key in sel) {
+        if (String(it.meta[key]) !== sel[key]) return false;
+      }
+      return true;
+    });
+    renderGrid(matches, sel);
+  };
+
+  function renderGrid(items, sel) {
+    var results = document.getElementById('resultsArea');
+    var activeCount = Object.keys(sel).length;
+    var summary = '<div class="count">Showing <b>' + items.length + '</b> of ' +
+                  STATE.items.length + ' slides' +
+                  (activeCount ? ' &middot; ' + activeCount + ' filter(s) active' : '') + '</div>';
+
+    if (!items.length) {
+      results.innerHTML = '<div class="card">' + summary +
+        '<div class="empty">No slides match the selected filters.</div></div>';
+      return;
+    }
+
+    var cards = items.map(function(it) {
+      var thumb;
+      if (it.largeImage) {
+        var src = STATE.apiUrl + '/item/' + it._id +
+                  '/tiles/thumbnail?width=190&height=140' +
+                  (STATE.token ? '&token=' + encodeURIComponent(STATE.token) : '');
+        thumb = '<div class="thumb"><img loading="lazy" src="' + src +
+                '" onerror="this.parentNode.textContent=\\'no thumbnail\\'"></div>';
+      } else {
+        thumb = '<div class="thumb">not a slide</div>';
+      }
+      var chips = Object.keys(it.meta).map(function(k) {
+        return '<span class="chip">' + esc(prettify(k)) + ': ' + esc(String(it.meta[k])) + '</span>';
+      }).join('');
+      var href = '/histomics#?image=' + it._id;
+      return '<a class="slide" href="' + href + '" target="_blank" rel="noopener">' +
+             thumb + '<div class="body"><div class="nm">' + esc(it.name) + '</div>' +
+             chips + '</div></a>';
+    }).join('');
+
+    results.innerHTML = '<div class="card">' + summary +
+                        '<div class="grid">' + cards + '</div></div>';
+  }
+
+  function prettify(k) {
+    return k.replace(/_/g, ' ').replace(/\\b\\w/g, function(c){ return c.toUpperCase(); });
+  }
+  function esc(s) {
+    return String(s)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  // Auto-load if a folderId was passed in the URL
+  if (qs.get('folderId')) loadSlides();
 })();
 </script>
 </body>
