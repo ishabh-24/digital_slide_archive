@@ -25,9 +25,16 @@ Examples
   python annotation_points.py list --item-id 507f1f77bcf86cd799439011
   python annotation_points.py create --item-id ... --name "model_cells" --points points.json
   python annotation_points.py get --annotation-id ...
-  python annotation_points.py extract-points --annotation-id ...   # points only
+  python annotation_points.py extract-points --annotation-id ...   # ANY type -> [x,y,z] points
+  python annotation_points.py extract-points --item-id ... --as-json   # whole slide, JSON
+  python annotation_points.py extract-points --item-id ... --flat      # one flat point list
   python annotation_points.py elements --annotation-id ...         # circles, rects, polylines, ...
   python annotation_points.py elements --item-id ...               # all annotations on a slide
+
+extract-points converts every element type to python-readable coordinates:
+points stay as-is; brush/polyline/polygon/line/arrow yield their vertices;
+rectangles yield 4 (rotation-aware) corners; circles & ellipses are sampled into
+--circle-segments boundary points.
 """
 
 from __future__ import annotations
@@ -101,6 +108,93 @@ def _seg_len(p: list[float], q: list[float]) -> float:
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 
 
+def _center_xyz(el: dict[str, Any]) -> tuple[float, float, float]:
+    c = el.get("center") or [0.0, 0.0, 0.0]
+    z = float(c[2]) if len(c) > 2 else 0.0
+    return float(c[0]), float(c[1]), z
+
+
+def _rect_corners(el: dict[str, Any]) -> list[list[float]]:
+    """Four corners of a (possibly rotated) rectangle, as [x,y,z], closed order."""
+    cx, cy, cz = _center_xyz(el)
+    hw = float(el.get("width", 0)) / 2.0
+    hh = float(el.get("height", 0)) / 2.0
+    rot = float(el.get("rotation", 0) or 0)
+    cos_r, sin_r = math.cos(rot), math.sin(rot)
+    local = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+    return [[cx + dx * cos_r - dy * sin_r, cy + dx * sin_r + dy * cos_r, cz] for dx, dy in local]
+
+
+def _ellipse_points(el: dict[str, Any], segments: int) -> list[list[float]]:
+    """Sample a (possibly rotated) ellipse boundary into `segments` [x,y,z] points."""
+    cx, cy, cz = _center_xyz(el)
+    a = float(el.get("width", 0)) / 2.0
+    b = float(el.get("height", 0)) / 2.0
+    rot = float(el.get("rotation", 0) or 0)
+    cos_r, sin_r = math.cos(rot), math.sin(rot)
+    pts: list[list[float]] = []
+    for i in range(max(3, segments)):
+        t = 2.0 * math.pi * i / max(3, segments)
+        dx, dy = a * math.cos(t), b * math.sin(t)
+        pts.append([cx + dx * cos_r - dy * sin_r, cy + dx * sin_r + dy * cos_r, cz])
+    return pts
+
+
+def _circle_points(el: dict[str, Any], segments: int) -> list[list[float]]:
+    """Sample a circle boundary into `segments` [x,y,z] points."""
+    cx, cy, cz = _center_xyz(el)
+    r = float(el.get("radius", 0))
+    pts: list[list[float]] = []
+    for i in range(max(3, segments)):
+        t = 2.0 * math.pi * i / max(3, segments)
+        pts.append([cx + r * math.cos(t), cy + r * math.sin(t), cz])
+    return pts
+
+
+def element_to_vertices(el: dict[str, Any], circle_segments: int = 64) -> list[list[float]]:
+    """
+    Reduce ANY large_image annotation element to a list of [x, y, z] points so
+    that every annotation type is python-readable as coordinates.
+
+      point                  -> [center]
+      polyline / brush       -> its vertices
+      polygon                -> its outer vertices (holes ignored here; see summarize_element)
+      line / arrow           -> its vertices/endpoints
+      rectangle              -> 4 corners (rotation-aware)
+      circle / ellipse       -> `circle_segments` boundary samples (rotation-aware)
+      anything else with
+        'points' or 'center' -> those points / that center
+
+    Coordinates are base-layer pixels (large_image annotation schema).
+    """
+    t = el.get("type")
+    if t == "point":
+        c = el.get("center")
+        return [[float(c[0]), float(c[1]), float(c[2]) if len(c) > 2 else 0.0]] if c else []
+    if t in ("polyline", "polygon", "line", "arrow"):
+        return [list(p) for p in (el.get("points") or [])]
+    if t == "rectangle":
+        return _rect_corners(el)
+    if t == "ellipse":
+        return _ellipse_points(el, circle_segments)
+    if t == "circle":
+        return _circle_points(el, circle_segments)
+    # Fallback for heatmaps / griddata / overlays / unknown types
+    if isinstance(el.get("points"), list):
+        return [list(p) for p in el["points"]]
+    if el.get("center"):
+        cx, cy, cz = _center_xyz(el)
+        return [[cx, cy, cz]]
+    return []
+
+
+def _label_value(el: dict[str, Any]) -> Any:
+    lab = el.get("label")
+    if isinstance(lab, dict):
+        return lab.get("value")
+    return lab
+
+
 def summarize_element(el: dict[str, Any]) -> dict[str, Any]:
     """
     Reduce a large_image annotation element to geometry useful in Python.
@@ -114,9 +208,9 @@ def summarize_element(el: dict[str, Any]) -> dict[str, Any]:
         out["id"] = el["id"]
     if el.get("group"):
         out["group"] = el["group"]
-    lab = el.get("label")
-    if isinstance(lab, dict) and lab.get("value"):
-        out["label"] = lab["value"]
+    lab = _label_value(el)
+    if lab:
+        out["label"] = lab
 
     if t == "point":
         out["center"] = el.get("center")
@@ -137,14 +231,20 @@ def summarize_element(el: dict[str, Any]) -> dict[str, Any]:
         out["width"] = float(el.get("width", 0))
         out["height"] = float(el.get("height", 0))
         out["rotation_radians"] = float(el.get("rotation", 0))
-    elif t in ("polyline", "arrow"):
+        out["corners"] = _rect_corners(el)
+    elif t in ("polyline", "polygon", "line", "arrow"):
         pts = el.get("points") or []
         out["points"] = pts
-        if t == "polyline":
+        out["vertex_count"] = len(pts)
+        if t == "polygon":
+            out["closed"] = True
+            if el.get("holes"):
+                out["holes"] = el["holes"]
+        elif t == "polyline":
             out["closed"] = bool(el.get("closed", False))
         if len(pts) >= 2:
             perim = sum(_seg_len(pts[i], pts[i + 1]) for i in range(len(pts) - 1))
-            if t == "polyline" and out.get("closed") and len(pts) >= 3:
+            if out.get("closed") and len(pts) >= 3:
                 perim += _seg_len(pts[-1], pts[0])
             out["polyline_length"] = perim
     else:
@@ -195,11 +295,12 @@ def format_elements_text(payload: dict[str, Any] | list[Any]) -> str:
                         g.get("rotation_radians"),
                     )
                 )
-            elif t == "polyline":
+            elif t in ("polyline", "polygon", "line"):
                 lines.append(
-                    "  [%d] polyline  closed=%s  vertices=%d  length=%s"
+                    "  [%d] %s  closed=%s  vertices=%d  length=%s"
                     % (
                         i,
+                        t,
                         g.get("closed"),
                         len(g.get("points") or []),
                         g.get("polyline_length"),
@@ -326,19 +427,73 @@ def cmd_elements(client, args: argparse.Namespace) -> None:
         print(json.dumps(payload, indent=2))
 
 
+def _annotation_ids_for(client, args: argparse.Namespace) -> list[str]:
+    if getattr(args, "annotation_id", None):
+        return [args.annotation_id]
+    rows = client.get(
+        "annotation",
+        parameters={"itemId": args.item_id, "limit": getattr(args, "limit", 200), "offset": 0},
+    )
+    return [r["_id"] for r in rows]
+
+
 def cmd_extract_points(client, args: argparse.Namespace) -> None:
-    r = client.get("annotation/%s" % args.annotation_id)
-    ann = r.get("annotation") or r
-    elements = ann.get("elements") or []
-    centers = []
-    for el in elements:
-        if el.get("type") == "point" and "center" in el:
-            centers.append(el["center"])
+    """
+    Extract every annotation element to python-readable [x,y,z] points,
+    regardless of type (point, brush/polyline, polygon, rectangle, circle,
+    ellipse, line, arrow). Works on one annotation (--annotation-id) or all
+    annotations on a slide (--item-id).
+    """
+    want = {t.strip() for t in args.types.split(",")} if getattr(args, "types", None) else None
+    seg = getattr(args, "circle_segments", 64)
+
+    per_element: list[dict[str, Any]] = []
+    flat: list[list[float]] = []
+
+    for aid in _annotation_ids_for(client, args):
+        r = client.get("annotation/%s" % aid)
+        ann = r.get("annotation") or r
+        for idx, el in enumerate(ann.get("elements") or []):
+            t = el.get("type")
+            if want and t not in want:
+                continue
+            verts = element_to_vertices(el, circle_segments=seg)
+            entry: dict[str, Any] = {
+                "annotation_id": r.get("_id", aid),
+                "element_index": idx,
+                "type": t,
+                "points": verts,
+            }
+            if el.get("id"):
+                entry["id"] = el["id"]
+            if el.get("group"):
+                entry["group"] = el["group"]
+            lab = _label_value(el)
+            if lab:
+                entry["label"] = lab
+            if t in ("polyline", "polygon"):
+                entry["closed"] = True if t == "polygon" else bool(el.get("closed", False))
+            per_element.append(entry)
+            flat.extend(verts)
+
+    if args.flat:
+        if args.as_json:
+            print(json.dumps(flat, indent=2))
+        else:
+            for c in flat:
+                z = c[2] if len(c) > 2 else 0
+                print("%s\t%s\t%s" % (c[0], c[1], z))
+        return
+
     if args.as_json:
-        print(json.dumps(centers, indent=2))
+        print(json.dumps(per_element, indent=2))
     else:
-        for c in centers:
-            print("%s\t%s\t%s" % (c[0], c[1], c[2]))
+        for pe in per_element:
+            print("# element %d  type=%s  id=%s  group=%s  points=%d" % (
+                pe["element_index"], pe["type"], pe.get("id"), pe.get("group"), len(pe["points"])))
+            for c in pe["points"]:
+                z = c[2] if len(c) > 2 else 0
+                print("%s\t%s\t%s" % (c[0], c[1], z))
 
 
 def main() -> None:
@@ -381,10 +536,36 @@ def main() -> None:
 
     ep = sub.add_parser(
         "extract-points",
-        help="Print coordinates of point elements from an annotation id",
+        help="Extract ANY element type (brush/polyline, polygon, rectangle, circle, "
+        "ellipse, point, line, arrow) as python-readable [x,y,z] points",
     )
-    ep.add_argument("--annotation-id", required=True)
-    ep.add_argument("--as-json", action="store_true", help="Print JSON array of [x,y,z]")
+    eg = ep.add_mutually_exclusive_group(required=True)
+    eg.add_argument("--annotation-id", help="One annotation document id")
+    eg.add_argument("--item-id", help="Extract from every annotation on this slide item")
+    ep.add_argument("--as-json", action="store_true", help="Print JSON instead of TSV")
+    ep.add_argument(
+        "--flat",
+        action="store_true",
+        help="Flatten all elements into a single list of [x,y,z] (no per-element grouping)",
+    )
+    ep.add_argument(
+        "--types",
+        help="Comma-separated element types to include (default: all). "
+        "e.g. polyline,polygon,rectangle",
+    )
+    ep.add_argument(
+        "--circle-segments",
+        type=int,
+        default=64,
+        dest="circle_segments",
+        help="Boundary samples to approximate circle/ellipse (default: %(default)s)",
+    )
+    ep.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        help="With --item-id, max annotations to fetch (default: %(default)s)",
+    )
     ep.set_defaults(func=cmd_extract_points)
 
     dp = sub.add_parser(
