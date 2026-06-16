@@ -10,17 +10,17 @@ class DsaCsvPlugin(GirderPlugin):
 
         info['apiRoot'].dsa_tools = DsaCsvResource()
 
-        class _CsvUploadPage:
-            @cherrypy.expose
-            def index(self):
-                cherrypy.response.headers['Content-Type'] = 'text/html; charset=utf-8'
-                return get_upload_html()
+        # Girder's server root uses cherrypy's MethodDispatcher, so a webroot
+        # page must expose HTTP-verb methods (GET), not `index`.
+        class _HtmlPage:
+            exposed = True
 
-        class _SlideFilterPage:
-            @cherrypy.expose
-            def index(self, **kwargs):
-                cherrypy.response.headers['Content-Type'] = 'text/html; charset=utf-8'
-                return get_filter_html()
+            def __init__(self, render):
+                self._render = render
 
-        info['serverRoot'].csv_upload = _CsvUploadPage()
-        info['serverRoot'].slidefilter = _SlideFilterPage()
+            def GET(self, **params):
+                cherrypy.response.headers['Content-Type'] = 'text/html;charset=utf-8'
+                return self._render()
+
+        info['serverRoot'].csv_upload = _HtmlPage(get_upload_html)
+        info['serverRoot'].slidefilter = _HtmlPage(get_filter_html)

@@ -1,0 +1,2 @@
+[girder.plugin]
+dsa_csv = dsa_csv_plugin:DsaCsvPlugin

@@ -370,26 +370,6 @@ pre{background:#f8f9fa;padding:10px;border-radius:4px;font-size:.8em;
     return j.authToken.token;
   }
 
-  function showFolderChoices(hint, doc, folders) {
-    hint.textContent = doc.name + ' is a ' + doc._modelType +
-      ', not a folder. Slides live in folders — pick one:';
-    var box = document.createElement('div');
-    box.style.marginTop = '4px';
-    folders.forEach(function(f) {
-      var a = document.createElement('a');
-      a.href = '#';
-      a.textContent = '\\uD83D\\uDCC1 ' + f.name;
-      a.style.cssText = 'display:inline-block;margin:3px 10px 0 0;color:#2980b9;text-decoration:none';
-      a.addEventListener('click', function(e) {
-        e.preventDefault();
-        document.getElementById('folderId').value = f._id;
-        hint.textContent = 'Selected folder: ' + f.name + '  (ID: ' + f._id + ')';
-      });
-      box.appendChild(a);
-    });
-    hint.appendChild(box);
-  }
-
   window.lookupFolder = async function() {
     var apiUrl = document.getElementById('apiUrl').value.trim();
     var apiKey  = document.getElementById('apiKey').value.trim();
@@ -403,21 +383,8 @@ pre{background:#f8f9fa;padding:10px;border-radius:4px;font-size:.8em;
                           {headers:headers});
       if (!r.ok) throw new Error(await r.text());
       var doc = await r.json();
-      if (doc._modelType === 'folder') {
-        document.getElementById('folderId').value = doc._id;
-        hint.textContent = 'Found folder: ' + doc.name + '  (ID: ' + doc._id + ')';
-        return;
-      }
-      // Resolved to a collection/user/etc. — list its child folders to choose from.
-      var fr = await fetch(apiUrl + '/folder?parentType=' + encodeURIComponent(doc._modelType) +
-                           '&parentId=' + doc._id + '&limit=500', {headers:headers});
-      var folders = fr.ok ? await fr.json() : [];
-      if (!folders.length) {
-        hint.textContent = doc.name + ' is a ' + doc._modelType +
-          ' with no sub-folders. Enter the path to a folder that contains slides.';
-        return;
-      }
-      showFolderChoices(hint, doc, folders);
+      document.getElementById('folderId').value = doc._id;
+      hint.textContent = 'Found: ' + doc.name + '  (ID: ' + doc._id + ')';
     } catch(e) {
       hint.textContent = 'Error: ' + e.message;
     }
@@ -668,26 +635,6 @@ button{padding:9px 18px;border:none;border-radius:4px;font-size:.92em;cursor:poi
     return (await r.json()).authToken.token;
   }
 
-  function showFolderChoices(hint, doc, folders) {
-    hint.textContent = doc.name + ' is a ' + doc._modelType +
-      ', not a folder. Slides live in folders — pick one:';
-    var box = document.createElement('div');
-    box.style.marginTop = '4px';
-    folders.forEach(function(f) {
-      var a = document.createElement('a');
-      a.href = '#';
-      a.textContent = '\\uD83D\\uDCC1 ' + f.name;
-      a.style.cssText = 'display:inline-block;margin:3px 10px 0 0;color:#2980b9;text-decoration:none';
-      a.addEventListener('click', function(e) {
-        e.preventDefault();
-        document.getElementById('folderId').value = f._id;
-        hint.textContent = 'Selected folder: ' + f.name + '  (ID: ' + f._id + ')';
-      });
-      box.appendChild(a);
-    });
-    hint.appendChild(box);
-  }
-
   window.lookupFolder = async function() {
     var apiUrl = document.getElementById('apiUrl').value.trim();
     var apiKey = document.getElementById('apiKey').value.trim();
@@ -702,20 +649,8 @@ button{padding:9px 18px;border:none;border-radius:4px;font-size:.92em;cursor:poi
                           {headers:headers});
       if (!r.ok) throw new Error(await r.text());
       var doc = await r.json();
-      if (doc._modelType === 'folder') {
-        document.getElementById('folderId').value = doc._id;
-        hint.textContent = 'Found folder: ' + doc.name;
-        return;
-      }
-      var fr = await fetch(apiUrl + '/folder?parentType=' + encodeURIComponent(doc._modelType) +
-                           '&parentId=' + doc._id + '&limit=500', {headers:headers});
-      var folders = fr.ok ? await fr.json() : [];
-      if (!folders.length) {
-        hint.textContent = doc.name + ' is a ' + doc._modelType +
-          ' with no sub-folders. Enter a folder path that contains slides.';
-        return;
-      }
-      showFolderChoices(hint, doc, folders);
+      document.getElementById('folderId').value = doc._id;
+      hint.textContent = 'Found: ' + doc.name;
     } catch(e) { hint.textContent = 'Error: ' + e.message; }
   };
 
