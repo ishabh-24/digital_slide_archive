@@ -119,6 +119,14 @@ RUN pip install --no-cache-dir \
     sync && \
     find / -xdev -type d -name __pycache__ -exec rm -r {} \+
 
+# Install the local DSA CSV plugin BEFORE building the web client, so its
+# web_client bundle (the "Filter Slides" folder button) is compiled into the
+# girder client. Non-editable install: the project dir and package share a
+# name, which breaks editable (-e) namespace resolution.
+COPY devops/dsa/dsa_csv_plugin /opt/dsa_csv_plugin
+RUN pip install --no-cache-dir /opt/dsa_csv_plugin && \
+    find / -xdev -type d -name __pycache__ -exec rm -r {} \+
+
 # Build the girder web client
 RUN NPM_CONFIG_FUND=false NPM_CONFIG_AUDIT=false NPM_CONFIG_AUDIT_LEVEL=high NPM_CONFIG_LOGLEVEL=warn NPM_CONFIG_PROGRESS=false NPM_CONFIG_PREFER_OFFLINE=true \
     girder build && \
@@ -147,9 +155,9 @@ RUN echo 'task_acks_late = True' >> /opt/girder_worker/girder_worker/celeryconfi
 
 COPY . /opt/digital_slide_archive
 
-# Install local DSA CSV plugin (pure-Python, no girder build required)
-RUN pip install --no-cache-dir -e /opt/digital_slide_archive/devops/dsa/dsa_csv_plugin && \
-    find / -xdev -type d -name __pycache__ -exec rm -r {} \+
+# Note: the dsa_csv_plugin is installed earlier (before `girder build`) so its
+# web client is bundled. The plugin source is also present here under
+# devops/dsa/dsa_csv_plugin via this COPY.
 
 ENV PATH="/opt/digital_slide_archive/devops/dsa/utils:$PATH"
 

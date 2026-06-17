@@ -3,6 +3,7 @@ from girder.plugin import GirderPlugin
 
 class DsaCsvPlugin(GirderPlugin):
     DISPLAY_NAME = 'DSA CSV Import'
+    CLIENT_SOURCE_PATH = 'web_client'
 
     def load(self, info):
         import cherrypy

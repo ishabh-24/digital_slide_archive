@@ -1,4 +1,0 @@
-Metadata-Version: 2.4
-Name: dsa-csv-plugin
-Version: 0.1.0
-Requires-Dist: girder>=3.0.0
