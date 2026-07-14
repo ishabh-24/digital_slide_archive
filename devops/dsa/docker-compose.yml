@@ -70,7 +70,6 @@ services:
 
       # Add additional mounts here to get access to existing files on your
       # system.  Also add them to the worker container to reduce copying.
-      - /Users/ishabhatia/Desktop/penn-med-research/images:/data
     depends_on:
       - mongodb
       - memcached
