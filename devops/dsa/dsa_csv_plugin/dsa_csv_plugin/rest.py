@@ -1,6 +1,7 @@
 """REST resource and HTML page for DSA CSV metadata ingestion."""
 import csv as _csv
 import io
+import json as _json
 
 import cherrypy
 
@@ -112,6 +113,80 @@ def _upload_config_yaml(folder, yaml_dict, user):
 
 
 # ---------------------------------------------------------------------------
+# BCNB-style annotation JSON -> large_image annotation documents
+#
+# Input shape (every top-level key is a class):
+#   { "positive": [ {"name": "...", "vertices": [[x,y], ...]}, ... ],
+#     "negative": [ ... ] }
+# Each class becomes one annotation document (an independently toggleable,
+# independently colored layer in HistomicsUI). Vertices are level-0 pixel
+# coordinates, the same space HistomicsUI annotations use — no scaling.
+# ---------------------------------------------------------------------------
+
+_CLASS_COLORS = {
+    'positive': ('rgb(255,0,0)', 'rgba(255,0,0,0.25)'),
+    'negative': ('rgb(0,128,255)', 'rgba(0,128,255,0.25)'),
+    'tumor': ('rgb(255,0,0)', 'rgba(255,0,0,0.25)'),
+    'stroma': ('rgb(0,180,0)', 'rgba(0,180,0,0.25)'),
+}
+_ANN_PALETTE = [
+    ('rgb(255,0,0)', 'rgba(255,0,0,0.25)'),
+    ('rgb(0,128,255)', 'rgba(0,128,255,0.25)'),
+    ('rgb(0,180,0)', 'rgba(0,180,0,0.25)'),
+    ('rgb(200,120,0)', 'rgba(200,120,0,0.25)'),
+    ('rgb(150,0,200)', 'rgba(150,0,200,0.25)'),
+    ('rgb(0,160,160)', 'rgba(0,160,160,0.25)'),
+]
+
+
+def _ann_colors_for(class_name, index):
+    return _CLASS_COLORS.get(str(class_name).lower(),
+                             _ANN_PALETTE[index % len(_ANN_PALETTE)])
+
+
+def _polygon_element(vertices, label, group, line_color, fill_color):
+    points = [[float(v[0]), float(v[1]), 0.0] for v in vertices if len(v) >= 2]
+    return {
+        'type': 'polyline',
+        'closed': True,
+        'points': points,
+        'label': {'value': str(label)} if label else {},
+        'group': str(group),
+        'lineColor': line_color,
+        'lineWidth': 2,
+        'fillColor': fill_color,
+    }
+
+
+def bcnb_json_to_annotations(data, base_name):
+    """Parsed BCNB JSON dict -> list of annotation documents, one per class."""
+    if not isinstance(data, dict):
+        raise ValueError('top-level JSON must be an object of {class: [polygons]}')
+    docs = []
+    for idx, (class_name, polygons) in enumerate(sorted(data.items())):
+        if not isinstance(polygons, list):
+            continue
+        line_color, fill_color = _ann_colors_for(class_name, idx)
+        elements = []
+        for poly in polygons:
+            if not isinstance(poly, dict):
+                continue
+            verts = poly.get('vertices') or []
+            if len(verts) < 3:
+                continue
+            elements.append(_polygon_element(
+                verts, poly.get('name', ''), class_name, line_color, fill_color))
+        if not elements:
+            continue
+        docs.append({
+            'name': '{} - {}'.format(base_name, class_name),
+            'description': 'Imported annotation ({} regions)'.format(class_name),
+            'elements': elements,
+        })
+    return docs
+
+
+# ---------------------------------------------------------------------------
 # REST resource
 # ---------------------------------------------------------------------------
 
@@ -121,6 +196,8 @@ class DsaCsvResource(Resource):
         self.resourceName = 'dsa_tools'
         self.route('POST', ('folder', ':folderId', 'ingest_csv'), self.ingest_csv)
         self.route('GET', ('folder', ':folderId', 'slide_meta'), self.slide_meta)
+        self.route('POST', ('item', ':itemId', 'ingest_annotation_json'),
+                   self.ingest_annotation_json)
 
     @access.public
     @autoDescribeRoute(
@@ -249,6 +326,67 @@ class DsaCsvResource(Resource):
         return result
 
 
+    @access.user
+    @autoDescribeRoute(
+        Description('Convert a BCNB-style annotation JSON and attach it to an '
+                    'item as HistomicsUI annotations. Every top-level key in the '
+                    'JSON becomes one colored, toggleable annotation layer.')
+        .modelParam('itemId', 'Target slide item', model=Item,
+                    level=AccessType.WRITE, paramType='path')
+        .jsonParam('body',
+                   'JSON object with keys: json_content (string, the raw BCNB '
+                   'annotation JSON), replace (bool, default false — if true, an '
+                   'existing annotation of the same name is removed first)',
+                   paramType='body', requireObject=True)
+    )
+    def ingest_annotation_json(self, item, body, params):
+        from girder_large_image_annotation.models.annotation import Annotation
+
+        raw = body.get('json_content', '')
+        replace = bool(body.get('replace', False))
+        try:
+            data = _json.loads(raw)
+        except (ValueError, TypeError) as exc:
+            return {'error': 'Invalid JSON: %s' % exc}
+
+        base_name = item['name'].rsplit('.', 1)[0]
+        try:
+            docs = bcnb_json_to_annotations(data, base_name)
+        except ValueError as exc:
+            return {'error': str(exc)}
+
+        if not docs:
+            return {'error': 'No usable annotation regions found in JSON. Expected '
+                             '{"<class>": [{"vertices": [[x,y],...]}, ...]}.'}
+
+        user = self.getCurrentUser()
+        existing = {
+            a['annotation']['name']: a
+            for a in Annotation().findWithPermissions(
+                {'itemId': item['_id']}, user=user, level=AccessType.WRITE)
+            if a.get('annotation', {}).get('name')
+        }
+
+        created = []
+        for doc in docs:
+            if doc['name'] in existing:
+                if replace:
+                    Annotation().remove(existing[doc['name']])
+                else:
+                    continue  # skip; leave the existing one in place
+            Annotation().createAnnotation(item, user, doc)
+            created.append({'name': doc['name'], 'elements': len(doc['elements'])})
+
+        return {
+            'item_id': str(item['_id']),
+            'item_name': item['name'],
+            'annotations_created': created,
+            'layers': [d['name'] for d in docs],
+            'skipped_existing': [d['name'] for d in docs
+                                 if d['name'] in existing and not replace],
+        }
+
+
 # ---------------------------------------------------------------------------
 # HTML upload page (served at /csv_upload by the plugin __init__)
 # ---------------------------------------------------------------------------
@@ -259,6 +397,10 @@ def get_upload_html():
 
 def get_filter_html():
     return _FILTER_HTML
+
+
+def get_annotation_html():
+    return _ANNOTATION_HTML
 
 
 _HTML = """<!DOCTYPE html>
@@ -1009,6 +1151,199 @@ button{padding:9px 18px;border:none;border-radius:4px;font-size:.92em;cursor:poi
 
   // Auto-load if a folderId was passed in the URL
   if (qs.get('folderId')) loadSlides();
+})();
+</script>
+</body>
+</html>"""
+
+
+_ANNOTATION_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DSA &mdash; Upload Annotation JSON</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+     background:#f0f2f5;color:#333;padding:32px 16px}
+.wrap{max-width:720px;margin:0 auto}
+h1{font-size:1.35em;color:#1a3a5c;border-bottom:3px solid #3498db;
+   padding-bottom:10px;margin-bottom:20px}
+.card{background:#fff;border-radius:8px;padding:24px;margin-bottom:16px;
+      box-shadow:0 1px 4px rgba(0,0,0,.08)}
+h2{font-size:.95em;text-transform:uppercase;letter-spacing:.05em;
+   color:#7f8c8d;margin-bottom:14px}
+label{display:block;font-size:.85em;font-weight:600;color:#555;margin-bottom:4px}
+input,select{width:100%;padding:8px 10px;border:1px solid #d1d5db;border-radius:4px;
+             font-size:.95em;margin-bottom:12px;transition:border .15s}
+input:focus,select:focus{outline:none;border-color:#3498db}
+.row{display:flex;gap:10px;align-items:flex-start}
+.row input{margin-bottom:0}
+.hint{font-size:.78em;color:#9b59b6;margin-top:-8px;margin-bottom:12px}
+.chk{display:flex;align-items:center;gap:8px;font-size:.85em;color:#555;margin-bottom:4px}
+.chk input{width:auto;margin:0}
+button{padding:9px 22px;border:none;border-radius:4px;font-size:.95em;cursor:pointer}
+.btn-primary{background:#3498db;color:#fff}
+.btn-primary:hover{background:#2980b9}
+.btn-primary:disabled{background:#a0bdd8;cursor:default}
+.btn-sm{background:#ecf0f1;color:#333;font-size:.82em;padding:7px 14px;flex-shrink:0}
+.btn-sm:hover{background:#d5dbdb}
+#result{display:none}
+.ok{background:#eafaf1;border:1px solid #a9dfbf;border-radius:4px;padding:14px;color:#1e8449}
+.err{background:#fdedec;border:1px solid #f5b7b1;border-radius:4px;padding:14px;color:#922b21}
+.tag{display:inline-block;background:#ebf5fb;color:#2471a3;border-radius:3px;
+     padding:2px 7px;margin:2px;font-size:.8em;font-family:monospace}
+.biglink{display:inline-block;font-weight:600;color:#2980b9;text-decoration:none;margin-top:6px}
+.biglink:hover{text-decoration:underline}
+.topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.topbar a{font-size:.82em;color:#2980b9;text-decoration:none}
+.topbar a:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <h1 style="border:none;margin:0;padding:0">DSA &mdash; Upload Annotation JSON</h1>
+    <a href="/csv_upload">CSV import &rarr;</a>
+  </div>
+
+  <div class="card">
+    <h2>1 &nbsp; Connection</h2>
+    <label for="apiUrl">Girder API URL</label>
+    <input id="apiUrl" type="text" placeholder="http://localhost:8080/api/v1">
+    <label for="apiKey">API Key</label>
+    <input id="apiKey" type="password" placeholder="Paste your Girder API key">
+    <p class="hint">Generate a key: Girder UI &rarr; top-right user menu &rarr; My Account &rarr; API keys.</p>
+  </div>
+
+  <div class="card">
+    <h2>2 &nbsp; Target Slide (Item)</h2>
+    <label for="itemPath">Item path (optional lookup)</label>
+    <div class="row">
+      <input id="itemPath" type="text" placeholder="/collection/BCNB/Images/1.svs">
+      <button class="btn-sm" type="button" onclick="lookupItem()">Look up</button>
+    </div>
+    <p class="hint" id="itemHint">&nbsp;</p>
+    <label for="itemId" style="margin-top:4px">Item ID</label>
+    <input id="itemId" type="text" placeholder="5f3a1b2c3d4e5f6a7b8c9d0e">
+  </div>
+
+  <div class="card">
+    <h2>3 &nbsp; Annotation JSON</h2>
+    <label for="jsonFile">Select JSON file</label>
+    <input id="jsonFile" type="file" accept=".json,application/json">
+    <p class="hint">Expected: {&quot;positive&quot;: [{&quot;vertices&quot;: [[x,y],...]}], &quot;negative&quot;: [...]}. Each top-level key becomes one colored layer.</p>
+    <label class="chk"><input id="replace" type="checkbox"> Replace existing annotation layers of the same name</label>
+  </div>
+
+  <div class="card" style="text-align:center">
+    <button id="submitBtn" class="btn-primary" onclick="run()">Upload &amp; Attach Annotations</button>
+  </div>
+
+  <div class="card" id="result">
+    <h2>Result</h2>
+    <div id="resultBody"></div>
+  </div>
+</div>
+
+<script>
+(function(){
+  document.getElementById('apiUrl').value = window.location.origin + '/api/v1';
+  var qs = new URLSearchParams(window.location.search);
+  if (qs.get('itemId')) document.getElementById('itemId').value = qs.get('itemId');
+
+  async function getToken(apiUrl, apiKey) {
+    var r = await fetch(apiUrl + '/api_key/token?key=' + encodeURIComponent(apiKey) + '&duration=1',
+                        {method:'POST'});
+    if (!r.ok) throw new Error('Auth failed: ' + await r.text());
+    return (await r.json()).authToken.token;
+  }
+
+  window.lookupItem = async function() {
+    var apiUrl = document.getElementById('apiUrl').value.trim();
+    var apiKey = document.getElementById('apiKey').value.trim();
+    var path   = document.getElementById('itemPath').value.trim();
+    var hint   = document.getElementById('itemHint');
+    if (!path) { hint.textContent = 'Enter a path first.'; return; }
+    try {
+      var headers = {};
+      if (apiKey) headers['Girder-Token'] = await getToken(apiUrl, apiKey);
+      var r = await fetch(apiUrl + '/resource/lookup?path=' + encodeURIComponent(path), {headers:headers});
+      if (!r.ok) throw new Error(await r.text());
+      var doc = await r.json();
+      if (doc._modelType === 'item') {
+        document.getElementById('itemId').value = doc._id;
+        hint.textContent = 'Found item: ' + doc.name + '  (ID: ' + doc._id + ')';
+      } else {
+        hint.textContent = doc.name + ' is a ' + doc._modelType +
+          ', not an item. Give the full path to a slide file.';
+      }
+    } catch(e) { hint.textContent = 'Error: ' + e.message; }
+  };
+
+  window.run = async function() {
+    var apiUrl  = document.getElementById('apiUrl').value.trim();
+    var apiKey  = document.getElementById('apiKey').value.trim();
+    var itemId  = document.getElementById('itemId').value.trim();
+    var replace = document.getElementById('replace').checked;
+    var file    = document.getElementById('jsonFile').files[0];
+    if (!apiKey) { alert('API key required.'); return; }
+    if (!itemId) { alert('Item ID required.'); return; }
+    if (!file)   { alert('Select a JSON file.'); return; }
+
+    var btn = document.getElementById('submitBtn');
+    btn.disabled = true; btn.textContent = 'Working...';
+    try {
+      var token = await getToken(apiUrl, apiKey);
+      var jsonContent = await file.text();
+      var r = await fetch(apiUrl + '/dsa_tools/item/' + itemId + '/ingest_annotation_json', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json','Girder-Token':token},
+        body: JSON.stringify({json_content: jsonContent, replace: replace}),
+      });
+      renderResult(r.ok, await r.json(), itemId);
+    } catch(e) {
+      renderResult(false, {error: e.message}, itemId);
+    } finally {
+      btn.disabled = false; btn.textContent = 'Upload & Attach Annotations';
+    }
+  };
+
+  function renderResult(ok, data, itemId) {
+    var div = document.getElementById('result');
+    var body = document.getElementById('resultBody');
+    div.style.display = 'block';
+    if (!ok || data.error) {
+      body.innerHTML = '<div class="err"><strong>Error:</strong> ' +
+        esc(data.error || data.message || JSON.stringify(data)) + '</div>';
+      return;
+    }
+    var created = data.annotations_created || [];
+    var html = '<div class="ok"><strong>' + created.length + ' annotation layer(s) attached to ' +
+               esc(data.item_name || '') + '</strong>';
+    if (created.length) {
+      html += '<br><br>';
+      created.forEach(function(c){
+        html += '<span class="tag">' + esc(c.name) + ' (' + c.elements + ' region' +
+                (c.elements===1?'':'s') + ')</span>';
+      });
+    }
+    if (data.skipped_existing && data.skipped_existing.length) {
+      html += '<br><br>Skipped (already present, not replaced): ' +
+              data.skipped_existing.map(esc).join(', ');
+    }
+    html += '<br><br><a class="biglink" href="/histomics#?image=' + encodeURIComponent(itemId) +
+            '" target="_blank" rel="noopener">Open this slide in HistomicsUI to view annotations &rarr;</a>';
+    html += '</div>';
+    body.innerHTML = html;
+    div.scrollIntoView({behavior:'smooth'});
+  }
+
+  function esc(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
 })();
 </script>
 </body>

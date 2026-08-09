@@ -7,7 +7,8 @@ class DsaCsvPlugin(GirderPlugin):
 
     def load(self, info):
         import cherrypy
-        from .rest import DsaCsvResource, get_filter_html, get_upload_html
+        from .rest import (DsaCsvResource, get_annotation_html, get_filter_html,
+                           get_upload_html)
 
         info['apiRoot'].dsa_tools = DsaCsvResource()
 
@@ -25,3 +26,4 @@ class DsaCsvPlugin(GirderPlugin):
 
         info['serverRoot'].csv_upload = _HtmlPage(get_upload_html)
         info['serverRoot'].slidefilter = _HtmlPage(get_filter_html)
+        info['serverRoot'].annotation_upload = _HtmlPage(get_annotation_html)
