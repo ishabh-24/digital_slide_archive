@@ -186,6 +186,17 @@ def _class_of(obj, default, class_key=None):
                 return val.strip()
             if isinstance(val, dict) and isinstance(val.get('name'), str):
                 return val['name'].strip()
+    # A *dict-valued* 'label'/'class' describes the class (BEETLE writes
+    # {"label": {"name": "invasive tumor", "value": 1}}), whereas a
+    # *string-valued* 'label' names one region and must not become the class.
+    for src in sources:
+        for key in ('label', 'class', 'category', 'annotation'):
+            val = src.get(key)
+            if isinstance(val, dict):
+                for namekey in ('name', 'class', 'category', 'text'):
+                    inner = val.get(namekey)
+                    if isinstance(inner, str) and inner.strip():
+                        return inner.strip()
     return default
 
 
