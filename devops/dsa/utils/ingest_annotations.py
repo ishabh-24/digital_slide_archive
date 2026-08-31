@@ -83,7 +83,9 @@ _CLASS_COLORS = {
     'invasive tumor': ('rgb(255,0,0)', 'rgba(255,0,0,0.25)'),
     'stroma': ('rgb(0,180,0)', 'rgba(0,180,0,0.25)'),
     'in-situ tumor': ('rgb(200,120,0)', 'rgba(200,120,0,0.25)'),
+    'non-invasive epithelium': ('rgb(200,120,0)', 'rgba(200,120,0,0.25)'),
     'necrosis': ('rgb(90,90,90)', 'rgba(90,90,90,0.25)'),
+    'other': ('rgb(150,0,200)', 'rgba(150,0,200,0.25)'),
 }
 _PALETTE = [
     ('rgb(255,0,0)', 'rgba(255,0,0,0.25)'),
