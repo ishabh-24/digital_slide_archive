@@ -300,13 +300,21 @@ def _key_for(name, regex):
     return (match.group(1) if match.groups() else match.group(0)).strip().lower()
 
 
-def build_slide_index(client, collection_id, key_regex=None):
-    """Map pairing-key -> slide item, for every WSI item in the collection."""
+def build_slide_index(client, resource_id, key_regex=None,
+                      resource_type='collection'):
+    """Map pairing-key -> slide item, for every WSI item under a resource.
+
+    Scope this to a folder rather than a whole collection when the dataset
+    stores same-named files side by side: BEETLE ships
+    ``annotations/masks/<slide>.tif`` next to ``images/.../wsis/<slide>.tif``,
+    so a collection-wide index has two items per key and the mask can shadow
+    the slide.
+    """
     index, collisions = {}, set()
     offset, limit = 0, 200
     while True:
-        items = client.get('resource/%s/items' % collection_id,
-                           parameters={'type': 'collection',
+        items = client.get('resource/%s/items' % resource_id,
+                           parameters={'type': resource_type,
                                        'limit': limit, 'offset': offset})
         if not items:
             break
@@ -445,6 +453,11 @@ def main():
     p.add_argument('--json-key-regex', help='Regex applied to the JSON filename '
                                             'to derive the pairing key.')
     p.add_argument('--collection-id', help='Girder collection holding the slides.')
+    p.add_argument('--slide-folder-id',
+                   help='Index only slides under this folder (recursively) '
+                        'instead of the whole collection. Use when same-named '
+                        'files (e.g. annotation masks) live elsewhere in the '
+                        'collection and would otherwise shadow the slides.')
     p.add_argument('--class-key', help='Force this JSON field as the class name.')
     p.add_argument('--label-key', help='Force this JSON field as the per-region label.')
     p.add_argument('--scale', type=float, default=1.0,
@@ -463,20 +476,28 @@ def main():
         _inspect(args.inspect)
         return
 
-    if not args.collection_id:
-        sys.exit('--collection-id is required (or use --inspect).')
+    if not (args.collection_id or args.slide_folder_id):
+        sys.exit('--collection-id or --slide-folder-id is required '
+                 '(or use --inspect).')
     if bool(args.manifest) == bool(args.annotations_dir):
         sys.exit('Give exactly one of --manifest or --annotations-dir.')
 
     client = connect(args.api_url, args.api_key)
 
-    print('Indexing slide items under collection %s ...' % args.collection_id)
-    index, collisions = build_slide_index(client, args.collection_id,
-                                          args.slide_key_regex)
+    if args.slide_folder_id:
+        scope_id, scope_type = args.slide_folder_id, 'folder'
+    else:
+        scope_id, scope_type = args.collection_id, 'collection'
+    print('Indexing slide items under %s %s ...' % (scope_type, scope_id))
+    index, collisions = build_slide_index(client, scope_id,
+                                          args.slide_key_regex, scope_type)
     print('  %d slide item(s) indexed.' % len(index))
     if collisions:
-        print('  WARNING: %d key(s) match more than one slide (last wins): %s'
+        print('  WARNING: %d key(s) match more than one slide (LAST ONE WINS, '
+              'which is arbitrary): %s'
               % (len(collisions), ', '.join(sorted(collisions)[:5])))
+        print('  Annotations may attach to the wrong item. Narrow the scope '
+              'with --slide-folder-id before running without --dry-run.')
 
     if args.manifest:
         pairs, incomplete = pairs_from_manifest(
