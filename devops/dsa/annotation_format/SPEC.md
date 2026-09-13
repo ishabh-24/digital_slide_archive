@@ -7,7 +7,9 @@ constrained profile of GeoJSON (RFC 7946): every valid file is ordinary GeoJSON,
 but not every GeoJSON file is valid here. Bulk uploads pair files with slides
 through a manifest, as `utils/ingest_annotations.py` does today.
 
-- Schema: [`dsa-annotation-v1.schema.json`](dsa-annotation-v1.schema.json)
+- Schema: [`dsa-annotation-v1.schema.json`](../dsa_csv_plugin/dsa_csv_plugin/schemas/dsa-annotation-v1.schema.json) (inside the plugin package so the upload route can load it)
+- Validator: [`annotation_format.py`](../dsa_csv_plugin/dsa_csv_plugin/annotation_format.py); command line: [`utils/validate_annotation.py`](../utils/validate_annotation.py)
+- Converter: [`utils/convert_annotations.py`](../utils/convert_annotations.py)
 - Example: [`example-beetle-patient104_wsi1.json`](example-beetle-patient104_wsi1.json)
 
 ## Minimal file
