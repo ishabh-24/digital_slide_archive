@@ -1,0 +1,275 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dsa.local/schemas/dsa-annotation-v1.schema.json",
+  "title": "DSA Annotation Format v1 (draft)",
+  "description": "A constrained GeoJSON FeatureCollection holding the annotations for one whole-slide image. Structural rules only: cross-field checks (declared classes, closed rings, in-bounds coordinates, slide identity) are enforced by the ingest validator and listed in SPEC.md.",
+  "type": "object",
+  "required": [
+    "type",
+    "properties",
+    "features"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "const": "FeatureCollection"
+    },
+    "properties": {
+      "$ref": "#/$defs/collectionProperties"
+    },
+    "features": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/feature"
+      }
+    }
+  },
+  "$defs": {
+    "collectionProperties": {
+      "type": "object",
+      "required": [
+        "format",
+        "version",
+        "coordinate_space",
+        "slide",
+        "classes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "const": "dsa-annotation"
+        },
+        "version": {
+          "const": "1.0"
+        },
+        "coordinate_space": {
+          "const": "level0_pixels",
+          "description": "Full-resolution pixel coordinates. Origin at the top-left corner, x to the right, y downward."
+        },
+        "slide": {
+          "type": "object",
+          "required": [
+            "name"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Filename of the slide these annotations belong to, including extension."
+            },
+            "sizeX": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Level-0 width in pixels. If given, must match the target item."
+            },
+            "sizeY": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Level-0 height in pixels. If given, must match the target item."
+            }
+          }
+        },
+        "classes": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/classDefinition"
+          },
+          "description": "Classes used in this file. Every name must exist in the target collection's class vocabulary (checked at ingest)."
+        },
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Optional. Where these annotations came from; recorded on the annotation for traceability.",
+          "properties": {
+            "source_format": {
+              "type": "string",
+              "examples": [
+                "beetle",
+                "bcnb",
+                "qupath-geojson",
+                "asap-xml",
+                "histomicsui"
+              ]
+            },
+            "source_file": {
+              "type": "string"
+            },
+            "converter": {
+              "type": "string",
+              "examples": [
+                "convert_annotations.py 1.0"
+              ]
+            },
+            "converted_at": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        }
+      }
+    },
+    "classDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "color": {
+          "type": "string",
+          "pattern": "^#[0-9A-Fa-f]{6}$",
+          "description": "Optional outline color as #RRGGBB; fill uses the same color at 25% opacity. Resolution order at ingest: collection vocabulary color, then this value, then the default palette (black, white, alternating in vocabulary order)."
+        },
+        "description": {
+          "type": "string"
+        }
+      }
+    },
+    "feature": {
+      "type": "object",
+      "required": [
+        "type",
+        "geometry",
+        "properties"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "Feature"
+        },
+        "id": {
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "geometry": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/polygon"
+            },
+            {
+              "$ref": "#/$defs/multiPolygon"
+            },
+            {
+              "$ref": "#/$defs/point"
+            }
+          ],
+          "description": "Polygon or MultiPolygon for regions; Point for cell detections."
+        },
+        "properties": {
+          "type": "object",
+          "required": [
+            "class"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "class": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Must be a key of properties.classes on the collection."
+            },
+            "label": {
+              "type": "string",
+              "maxLength": 200,
+              "description": "Optional per-region text shown in HistomicsUI."
+            },
+            "attributes": {
+              "type": "object",
+              "description": "Optional free-form metadata (annotator, confidence, ...) passed through to the element's user data."
+            }
+          }
+        }
+      }
+    },
+    "position": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "type": "number",
+          "minimum": 0
+        },
+        {
+          "type": "number",
+          "minimum": 0
+        }
+      ],
+      "items": false,
+      "minItems": 2,
+      "description": "[x, y] in level-0 pixels. No third (z) value in v1."
+    },
+    "linearRing": {
+      "type": "array",
+      "minItems": 4,
+      "items": {
+        "$ref": "#/$defs/position"
+      },
+      "description": "Closed ring: at least 3 distinct vertices plus a repeat of the first vertex at the end."
+    },
+    "polygonCoordinates": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/linearRing"
+      },
+      "description": "First ring is the outer boundary; any further rings are holes, which must lie inside the outer ring and not cross each other."
+    },
+    "polygon": {
+      "type": "object",
+      "required": [
+        "type",
+        "coordinates"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "Polygon"
+        },
+        "coordinates": {
+          "$ref": "#/$defs/polygonCoordinates"
+        }
+      }
+    },
+    "multiPolygon": {
+      "type": "object",
+      "required": [
+        "type",
+        "coordinates"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "MultiPolygon"
+        },
+        "coordinates": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/polygonCoordinates"
+          }
+        }
+      }
+    },
+    "point": {
+      "type": "object",
+      "required": [
+        "type",
+        "coordinates"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "Point"
+        },
+        "coordinates": {
+          "$ref": "#/$defs/position"
+        }
+      },
+      "description": "One cell detection (or any single-location annotation)."
+    }
+  }
+}

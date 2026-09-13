@@ -1,0 +1,52 @@
+{
+  "type": "FeatureCollection",
+  "properties": {
+    "format": "dsa-annotation",
+    "version": "1.0",
+    "coordinate_space": "level0_pixels",
+    "slide": { "name": "patient104_wsi1.tif" },
+    "classes": {
+      "non-invasive epithelium": { "color": "#C87800", "description": "BEETLE label value 2" },
+      "other": { "color": "#9600C8", "description": "BEETLE label value 1" }
+    },
+    "provenance": {
+      "source_format": "beetle",
+      "source_file": "annotations/jsons/patient104_wsi1.json",
+      "converter": "hand-converted example (first region of each class)"
+    }
+  },
+  "features": [
+    {
+      "type": "Feature",
+      "id": 0,
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [23309.92385, 97643.9375], [23349.63865, 97574.4455], [23409.209, 97518.844],
+          [23486.6504, 97500.9765], [23564.0918, 97520.828], [23625.64845, 97574.4455],
+          [23681.24805, 97639.969], [23724.93165, 97713.4455], [23760.67385, 97788.8985],
+          [23786.4883, 97866.336], [23786.4883, 97947.75], [23728.9043, 98003.3515],
+          [23651.4629, 98021.219], [23570.04885, 98017.25], [23498.56445, 97977.539],
+          [23437.0078, 97925.906], [23381.41015, 97866.336], [23313.8965, 97719.3985],
+          [23309.92385, 97643.9375]
+        ]]
+      },
+      "properties": { "class": "non-invasive epithelium", "label": "region 0" }
+    },
+    {
+      "type": "Feature",
+      "id": 33,
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [17177.9082, 85950.828], [17146.50195, 85958.492], [17126.584, 85983.008],
+          [17119.68945, 86012.883], [17121.2207, 86043.5235], [17135.00975, 86071.1015],
+          [17161.82225, 86086.422], [17192.46485, 86081.0625], [17217.74415, 86061.906],
+          [17230.0, 86032.797], [17232.29885, 86002.156], [17218.50975, 85974.578],
+          [17177.9082, 85950.828]
+        ]]
+      },
+      "properties": { "class": "other", "label": "region 33" }
+    }
+  ]
+}
