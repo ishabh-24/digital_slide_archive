@@ -19,6 +19,7 @@ Validation runs in two layers:
 
 import json
 import os
+import re
 from collections import defaultdict
 
 FORMAT_NAME = 'dsa-annotation'
@@ -424,3 +425,136 @@ def _check_bounds(report, index, geometry, slide):
     else:
         message = 'feature %d: %s; the region runs past the image edge.' % (index, detail)
     report.add('E-BOUNDS', ERROR, message)
+
+
+# ---------------------------------------------------------------------------
+# Upload: validated document -> large_image annotation documents
+# ---------------------------------------------------------------------------
+
+# Used for a class whose color neither the collection vocabulary nor the file sets.
+DEFAULT_PALETTE = ('#000000', '#FFFFFF')
+FILL_OPACITY = 0.25
+LINE_WIDTH = 2
+
+_HEX_COLOR = re.compile(r'^#[0-9A-Fa-f]{6}$')
+
+
+def class_order(classes, vocabulary=NOT_CHECKED):
+    """Class names in palette and layer order.
+
+    Follows the collection vocabulary when there is one, so a class keeps the
+    same default color and layer position on every slide; otherwise the file's
+    own order.
+    """
+    if isinstance(vocabulary, dict) and vocabulary:
+        return list(vocabulary) + [name for name in classes if name not in vocabulary]
+    return list(classes)
+
+
+def resolve_colors(classes, vocabulary=NOT_CHECKED):
+    """Map each class in ``classes`` to a ``#RRGGBB`` color.
+
+    Precedence: the collection vocabulary, then the file, then the default
+    palette. A malformed color at one level falls through to the next.
+    """
+    vocab = vocabulary if isinstance(vocabulary, dict) else {}
+    order = class_order(classes, vocabulary)
+    colors = {}
+    for name in classes:
+        for source in (vocab.get(name), classes.get(name)):
+            color = source.get('color') if isinstance(source, dict) else None
+            if isinstance(color, str) and _HEX_COLOR.match(color):
+                colors[name] = color.upper()
+                break
+        else:
+            colors[name] = DEFAULT_PALETTE[order.index(name) % len(DEFAULT_PALETTE)]
+    return colors
+
+
+def _rgb(color, alpha=None):
+    red, green, blue = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+    if alpha is None:
+        return 'rgb(%d,%d,%d)' % (red, green, blue)
+    return 'rgba(%d,%d,%d,%s)' % (red, green, blue, alpha)
+
+
+def _open_ring(ring):
+    """GeoJSON rings repeat their first vertex; large_image polylines don't."""
+    if len(ring) > 1 and ring[0] == ring[-1]:
+        ring = ring[:-1]
+    return [[float(position[0]), float(position[1]), 0.0] for position in ring]
+
+
+def _elements(feature, line_color, fill_color):
+    properties = feature['properties']
+    common = {'group': properties['class'], 'lineColor': line_color, 'lineWidth': LINE_WIDTH}
+    if properties.get('label'):
+        common['label'] = {'value': properties['label']}
+    if properties.get('attributes'):
+        common['user'] = properties['attributes']
+
+    geometry = feature['geometry']
+    if geometry['type'] == 'Point':
+        x, y = geometry['coordinates'][0], geometry['coordinates'][1]
+        element = {'type': 'point', 'center': [float(x), float(y), 0.0], 'fillColor': fill_color}
+        element.update(common)
+        return [element]
+
+    elements = []
+    for _, rings in _polygons(geometry):
+        element = {'type': 'polyline', 'closed': True, 'points': _open_ring(rings[0]),
+                   'fillColor': fill_color}
+        if len(rings) > 1:
+            element['holes'] = [_open_ring(ring) for ring in rings[1:]]
+        element.update(common)
+        elements.append(element)
+    return elements
+
+
+def to_large_image_annotations(doc, slide_stem, vocabulary=NOT_CHECKED):
+    """Convert a *validated* document into large_image annotation documents:
+    one per class that has features, named ``<slide stem> - <class>``."""
+    properties = doc['properties']
+    classes = properties['classes']
+    colors = resolve_colors(classes, vocabulary)
+    features_by_class = defaultdict(list)
+    for feature in doc['features']:
+        features_by_class[feature['properties']['class']].append(feature)
+
+    annotations = []
+    for name in class_order(classes, vocabulary):
+        if name not in features_by_class:
+            continue
+        line_color, fill_color = _rgb(colors[name]), _rgb(colors[name], FILL_OPACITY)
+        elements = []
+        for feature in features_by_class[name]:
+            elements.extend(_elements(feature, line_color, fill_color))
+        annotation = {
+            'name': '%s - %s' % (slide_stem, name),
+            'description': 'Imported from %s %s (%d element%s)' % (
+                FORMAT_NAME, FORMAT_VERSION, len(elements), '' if len(elements) == 1 else 's'),
+            'elements': elements,
+        }
+        if properties.get('provenance'):
+            annotation['attributes'] = {'provenance': properties['provenance']}
+        annotations.append(annotation)
+    return annotations
+
+
+def prepare_upload(text, slide=None, vocabulary=NOT_CHECKED, collection_name=None):
+    """Everything the upload does short of writing to the database.
+
+    :param slide: the target item as ``{'name', 'sizeX', 'sizeY'}``. Layers are
+        named after its name. Missing sizes produce W-NOTILES.
+    :returns: ``(report, annotations)``; ``annotations`` is empty unless the
+        document is valid.
+    """
+    doc, report = validate_json_text(text, slide=slide, vocabulary=vocabulary,
+                                     collection_name=collection_name)
+    if doc is not None and slide is not None and not (slide.get('sizeX') and slide.get('sizeY')):
+        report.add('W-NOTILES', WARNING,
+                   'could not read the slide size; coordinates were not bounds-checked')
+    if not report.ok:
+        return report, []
+    name = (slide or {}).get('name') or doc['properties']['slide']['name']
+    return report, to_large_image_annotations(doc, os.path.splitext(name)[0], vocabulary)

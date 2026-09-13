@@ -122,7 +122,7 @@ color on every slide.
 
 ## Validation
 
-Ingest runs two layers and reports **every** failure, not just the first.
+Ingest runs two layers and reports **every** failure, not just the first. The upload page's **Validate only** button runs every check without writing anything.
 
 **1. Schema** (structure, types, allowed values) — `dsa-annotation-v1.schema.json`.
 
@@ -139,6 +139,7 @@ Ingest runs two layers and reports **every** failure, not just the first.
 | `E-SIZE` | `slide.sizeX/sizeY`, if given, match the item | error | `slide.sizeX is 98000 but item is 49000 wide` |
 | `W-SLIDE` | `slide.name` equals the target item's name | warning | `file names "patient1_wsi1.tif" but the target item is "patient2_wsi1.tif"` |
 | `W-NOVOCAB` | The collection has a class vocabulary | warning | `collection "BEETLE" has no class vocabulary; classes were not checked` |
+| `W-NOTILES` | The slide's size could be read | warning | `could not read the slide size; coordinates were not bounds-checked` |
 | `W-UNUSED` | Declared class has no features | warning | `class "necrosis" is declared but unused` |
 
 Warnings never block the upload; they are listed with the result. `E-BOUNDS` is
@@ -151,7 +152,7 @@ TIFFs, which share filenames with the slides.
 | File | DSA annotation |
 |---|---|
 | Each class with ≥ 1 feature | One annotation document named `<slide stem> - <class>` (one toggleable layer) |
-| `Polygon` | `polyline` element, `closed: true`; rings after the first → element `holes` |
+| `Polygon` | `polyline` element, `closed: true`, repeated closing vertex dropped; rings after the first → element `holes` |
 | `MultiPolygon` | One `polyline` element per part |
 | `Point` | `point` element, `center: [x, y, 0]` |
 | resolved class color | `lineColor` = `rgb(...)`, `fillColor` = same at 0.25 alpha |

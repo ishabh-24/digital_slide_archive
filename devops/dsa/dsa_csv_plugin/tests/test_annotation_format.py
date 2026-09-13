@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -242,3 +243,156 @@ def test_report_as_dict_separates_errors_and_warnings():
     assert result['ok'] is False
     assert [issue['code'] for issue in result['errors']] == ['E-CLASS']
     assert [issue['code'] for issue in result['warnings']] == ['W-UNUSED']
+
+
+# --- upload: conversion to large_image annotations ---------------------------
+
+# large_image's colorSchema pattern, copied from girder_large_image_annotation.
+LARGE_IMAGE_COLOR = re.compile(r'^(#([0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})|'
+                               r'rgb\(\d+,\s*\d+,\s*\d+\)|'
+                               r'rgba\(\d+,\s*\d+,\s*\d+,\s*(\d?\.|)\d+\))$')
+REST_PY = os.path.join(HERE, os.pardir, 'dsa_csv_plugin', 'rest.py')
+
+
+def elements_of(annotations):
+    return [element for annotation in annotations for element in annotation['elements']]
+
+
+def test_colors_follow_vocabulary_then_file_then_default_palette():
+    classes = {'a': {'color': '#112233'}, 'b': {}, 'c': {'color': '#445566'}, 'd': {}}
+    vocabulary = {'c': {'color': '#aabbcc'}, 'b': {}, 'd': {}, 'a': {}}
+    assert af.resolve_colors(classes, vocabulary) == {
+        'a': '#112233',   # file color; vocabulary sets none
+        'b': '#FFFFFF',   # default palette, position 1 in vocabulary order
+        'c': '#AABBCC',   # vocabulary beats the file
+        'd': '#000000',   # default palette, position 2
+    }
+
+
+def test_default_color_is_the_same_on_every_slide_in_a_collection():
+    vocabulary = {'x': {}, 'y': {}, 'z': {}}
+    assert af.resolve_colors({'z': {}}, vocabulary)['z'] == '#000000'
+    assert af.resolve_colors({'y': {}, 'z': {}}, vocabulary) == {'y': '#FFFFFF', 'z': '#000000'}
+
+
+def test_malformed_vocabulary_color_falls_through_to_the_file():
+    assert af.resolve_colors({'a': {'color': '#010203'}}, {'a': {'color': 'red'}}) == {'a': '#010203'}
+
+
+def test_polygon_with_hole_becomes_a_polyline_with_holes():
+    hole = [[20, 20], [40, 20], [40, 40], [20, 20]]
+    annotations = af.to_large_image_annotations(make_doc([polygon([SQUARE, hole])]), 'slide')
+    assert [a['name'] for a in annotations] == ['slide - tumor']
+    element, = elements_of(annotations)
+    assert element['type'] == 'polyline' and element['closed'] is True
+    assert element['points'] == [[0.0, 0.0, 0.0], [100.0, 0.0, 0.0], [100.0, 100.0, 0.0], [0.0, 100.0, 0.0]]
+    assert element['holes'] == [[[20.0, 20.0, 0.0], [40.0, 20.0, 0.0], [40.0, 40.0, 0.0]]]
+    assert element['group'] == 'tumor'
+    assert (element['lineColor'], element['fillColor']) == ('rgb(0,0,0)', 'rgba(0,0,0,0.25)')
+
+
+def test_multipolygon_becomes_one_element_per_part():
+    feature = {'type': 'Feature', 'geometry': {'type': 'MultiPolygon', 'coordinates': [[SQUARE], [SQUARE]]},
+               'properties': {'class': 'tumor'}}
+    elements = elements_of(af.to_large_image_annotations(make_doc([feature]), 'slide'))
+    assert [e['type'] for e in elements] == ['polyline', 'polyline']
+    assert all('holes' not in e for e in elements)
+
+
+def test_cell_detection_becomes_a_point_element():
+    feature = point(12.5, 40, cls='lymphocyte')
+    feature['properties']['attributes'] = {'confidence': 0.93}
+    doc = make_doc([feature], classes={'lymphocyte': {'color': '#9600C8'}})
+    element, = elements_of(af.to_large_image_annotations(doc, 'slide'))
+    assert element == {'type': 'point', 'center': [12.5, 40.0, 0.0], 'group': 'lymphocyte',
+                       'lineColor': 'rgb(150,0,200)', 'lineWidth': 2,
+                       'fillColor': 'rgba(150,0,200,0.25)', 'user': {'confidence': 0.93}}
+
+
+def test_label_and_provenance_carry_over():
+    feature = polygon([SQUARE])
+    feature['properties']['label'] = 'region 0'
+    doc = make_doc([feature])
+    doc['properties']['provenance'] = {'source_format': 'beetle'}
+    annotation, = af.to_large_image_annotations(doc, 'slide')
+    assert annotation['elements'][0]['label'] == {'value': 'region 0'}
+    assert annotation['attributes'] == {'provenance': {'source_format': 'beetle'}}
+    assert annotation['description'] == 'Imported from dsa-annotation 1.0 (1 element)'
+
+
+def test_layers_follow_vocabulary_order():
+    doc = make_doc([polygon([SQUARE], 'tumor'), polygon([SQUARE], 'necrosis')],
+                   classes={'tumor': {}, 'necrosis': {}})
+    names = [a['name'] for a in af.to_large_image_annotations(doc, 's', {'necrosis': {}, 'tumor': {}})]
+    assert names == ['s - necrosis', 's - tumor']
+
+
+def test_every_generated_color_is_accepted_by_large_image():
+    doc = make_doc([polygon([SQUARE], c) for c in 'abc'] + [point(1, 1, 'd')],
+                   classes={'a': {}, 'b': {'color': '#0a0B0c'}, 'c': {}, 'd': {'color': '#FFFFFF'}})
+    for element in elements_of(af.to_large_image_annotations(doc, 's')):
+        assert LARGE_IMAGE_COLOR.match(element['lineColor']), element['lineColor']
+        assert LARGE_IMAGE_COLOR.match(element['fillColor']), element['fillColor']
+
+
+# --- upload: prepare_upload ------------------------------------------------
+
+TARGET = {'name': 'patient1_wsi1.tif', 'sizeX': 1000, 'sizeY': 1000}
+
+
+def test_valid_upload_names_layers_after_the_target_item():
+    report, annotations = af.prepare_upload(json.dumps(make_doc()), slide=TARGET)
+    assert report.ok
+    assert [a['name'] for a in annotations] == ['patient1_wsi1 - tumor']
+    assert messages(report, 'W-SLIDE') == ['file names "slide.tif" but the target item is "patient1_wsi1.tif"']
+
+
+def test_invalid_upload_produces_no_annotations():
+    report, annotations = af.prepare_upload(json.dumps(make_doc([polygon([scaled(SQUARE, 40)])])),
+                                            slide=TARGET)
+    assert {issue.code for issue in report.errors} == {'E-BOUNDS'}
+    assert annotations == []
+
+
+def test_class_outside_vocabulary_blocks_the_upload():
+    report, annotations = af.prepare_upload(json.dumps(make_doc()), slide=TARGET,
+                                            vocabulary={'necrosis': {}}, collection_name='BEETLE')
+    assert 'E-VOCAB' in report.codes
+    assert annotations == []
+
+
+def test_unreadable_slide_size_warns_but_uploads():
+    report, annotations = af.prepare_upload(json.dumps(make_doc()), slide={'name': 'slide.tif'})
+    assert report.ok and len(annotations) == 1
+    assert messages(report, 'W-NOTILES') == [
+        'could not read the slide size; coordinates were not bounds-checked']
+
+
+def test_bad_json_upload():
+    report, annotations = af.prepare_upload('not json', slide=TARGET)
+    assert report.codes == {'E-JSON'} and annotations == []
+
+
+def test_beetle_example_uploads_with_beetle_vocabulary_colors():
+    with open(EXAMPLE) as handle:
+        text = handle.read()
+    vocabulary = {'invasive epithelium': {'color': '#FF0000'},
+                  'non-invasive epithelium': {'color': '#C87800'},
+                  'necrosis': {'color': '#5A5A5A'}, 'other': {'color': '#9600C8'}}
+    report, annotations = af.prepare_upload(
+        text, slide={'name': 'patient104_wsi1.tif', 'sizeX': 100000, 'sizeY': 120000},
+        vocabulary=vocabulary, collection_name='BEETLE')
+    assert report.issues == []
+    assert {a['name']: a['elements'][0]['lineColor'] for a in annotations} == {
+        'patient104_wsi1 - non-invasive epithelium': 'rgb(200,120,0)',
+        'patient104_wsi1 - other': 'rgb(150,0,200)',
+    }
+
+
+def test_upload_route_uses_the_strict_validator():
+    with open(REST_PY) as handle:
+        source = handle.read()
+    compile(source, REST_PY, 'exec')
+    assert 'annotation_format.prepare_upload(' in source
+    assert 'def json_to_annotations' not in source
+

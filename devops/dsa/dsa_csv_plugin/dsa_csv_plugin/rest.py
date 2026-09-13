@@ -13,6 +13,8 @@ from girder.models.folder import Folder
 from girder.models.item import Item
 from girder.models.upload import Upload
 
+from . import annotation_format
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -113,210 +115,43 @@ def _upload_config_yaml(folder, yaml_dict, user):
 
 
 # ---------------------------------------------------------------------------
-# Polygon annotation JSON -> large_image annotation documents
-#
-# The shape is auto-detected, so one route serves several datasets:
-#   BCNB      {"positive": [{"name": ..., "vertices": [[x,y],...]}, ...], ...}
-#   BEETLE    [{"index": 0, "coordinates": [[x,y],...],
-#               "label": {"name": "invasive tumor", "value": 1}}, ...]
-#   GeoJSON   {"type":"FeatureCollection","features":[{"geometry":{...}}]}
-#   wrapped   {"annotations"|"objects"|"shapes"|"regions": [ ...as above... ]}
-#
-# Each distinct class becomes one annotation document, i.e. an independently
-# coloured, independently toggleable layer in HistomicsUI. Coordinates are used
-# as-is (level-0 pixels, the space HistomicsUI annotations live in) unless a
-# scale factor is supplied.
-#
-# Kept in sync with devops/dsa/utils/ingest_annotations.py, which is the bulk
-# equivalent of this route.
+# Annotation upload helpers. The format's rules, and the conversion to
+# large_image annotations, live in annotation_format.py.
 # ---------------------------------------------------------------------------
 
-_CLASS_COLORS = {
-    'positive': ('rgb(255,0,0)', 'rgba(255,0,0,0.25)'),
-    'negative': ('rgb(0,128,255)', 'rgba(0,128,255,0.25)'),
-    'tumor': ('rgb(255,0,0)', 'rgba(255,0,0,0.25)'),
-    'invasive tumor': ('rgb(255,0,0)', 'rgba(255,0,0,0.25)'),
-    'stroma': ('rgb(0,180,0)', 'rgba(0,180,0,0.25)'),
-    'in-situ tumor': ('rgb(200,120,0)', 'rgba(200,120,0,0.25)'),
-    'non-invasive epithelium': ('rgb(200,120,0)', 'rgba(200,120,0,0.25)'),
-    'necrosis': ('rgb(90,90,90)', 'rgba(90,90,90,0.25)'),
-    'other': ('rgb(150,0,200)', 'rgba(150,0,200,0.25)'),
-}
-_ANN_PALETTE = [
-    ('rgb(255,0,0)', 'rgba(255,0,0,0.25)'),
-    ('rgb(0,128,255)', 'rgba(0,128,255,0.25)'),
-    ('rgb(0,180,0)', 'rgba(0,180,0,0.25)'),
-    ('rgb(200,120,0)', 'rgba(200,120,0,0.25)'),
-    ('rgb(150,0,200)', 'rgba(150,0,200,0.25)'),
-    ('rgb(0,160,160)', 'rgba(0,160,160,0.25)'),
-    ('rgb(210,0,120)', 'rgba(210,0,120,0.25)'),
-]
+def _slide_info(item):
+    """Name and level-0 size of an item; just the name if it has no tile source."""
+    info = {'name': item['name']}
+    try:
+        from girder_large_image.models.image_item import ImageItem
 
-_COORD_KEYS = ('vertices', 'points', 'coordinates', 'coords', 'polygon', 'contour')
-_LIST_KEYS = ('annotations', 'objects', 'shapes', 'regions', 'features', 'items')
-# Deliberately excludes 'name'/'label' (those identify one region, not its
-# class) and 'type' (GeoJSON sets it to the literal "Feature").
-_CLASS_KEYS = ('class', 'class_name', 'category', 'classification', 'group')
+        metadata = ImageItem().getMetadata(item)
+    except Exception:
+        return info
+    for key in ('sizeX', 'sizeY'):
+        if metadata.get(key):
+            info[key] = int(metadata[key])
+    return info
 
 
-def _ann_colors_for(class_name, index):
-    return _CLASS_COLORS.get(str(class_name).strip().lower(),
-                             _ANN_PALETTE[index % len(_ANN_PALETTE)])
+def _collection_vocabulary(item):
+    """``(collection name, class vocabulary)`` for the collection holding an item.
 
-
-def _polygon_element(vertices, label, group, line_color, fill_color):
-    points = [[float(v[0]), float(v[1]), 0.0] for v in vertices if len(v) >= 2]
-    return {
-        'type': 'polyline',
-        'closed': True,
-        'points': points,
-        'label': {'value': str(label)} if label else {},
-        'group': str(group),
-        'lineColor': line_color,
-        'lineWidth': 2,
-        'fillColor': fill_color,
-    }
-
-
-def _is_point(v):
-    return (isinstance(v, (list, tuple)) and len(v) >= 2
-            and all(isinstance(c, (int, float)) for c in v[:2]))
-
-
-def _as_ring(value):
-    """Coerce nested coordinate lists to a flat [[x, y], ...] ring."""
-    if not isinstance(value, list) or not value:
-        return None
-    if _is_point(value[0]):
-        return [v for v in value if _is_point(v)]
-    inner = value[0]
-    if isinstance(inner, list) and inner:
-        return _as_ring(inner)
-    return None
-
-
-def _coords_of(obj):
-    if not isinstance(obj, dict):
-        return None
-    for key in _COORD_KEYS:
-        ring = _as_ring(obj.get(key))
-        if ring:
-            return ring
-    geom = obj.get('geometry')
-    if isinstance(geom, dict):
-        return _as_ring(geom.get('coordinates'))
-    return None
-
-
-def _class_of(obj, default, class_key=None):
-    """Best-effort class name for one polygon object."""
-    # Most specific first: QuPath/GeoJSON nest the real class under
-    # properties.classification, and the outer object often has a generic
-    # 'type' or a per-region 'name' that must not win.
-    sources = []
-    props = obj.get('properties')
-    if isinstance(props, dict):
-        nested = props.get('classification')
-        if isinstance(nested, dict):
-            sources.append(nested)
-        sources.append(props)
-    sources.append(obj)
-
-    keys = [class_key] if class_key else _CLASS_KEYS
-    for src in sources:
-        for key in keys:
-            if not key:
-                continue
-            val = src.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-            if isinstance(val, dict) and isinstance(val.get('name'), str):
-                return val['name'].strip()
-    # A *dict-valued* 'label'/'class' describes the class (BEETLE writes
-    # {"label": {"name": "invasive tumor", "value": 1}}), whereas a
-    # *string-valued* 'label' names one region and must not become the class.
-    for src in sources:
-        for key in ('label', 'class', 'category', 'annotation'):
-            val = src.get(key)
-            if isinstance(val, dict):
-                for namekey in ('name', 'class', 'category', 'text'):
-                    inner = val.get(namekey)
-                    if isinstance(inner, str) and inner.strip():
-                        return inner.strip()
-    return default
-
-
-def _walk(node, default_class, class_key, label_key, out):
-    """Collect (class, label, ring) triples from an arbitrarily shaped node."""
-    if isinstance(node, list):
-        for item in node:
-            _walk(item, default_class, class_key, label_key, out)
-        return
-
-    if not isinstance(node, dict):
-        return
-
-    ring = _coords_of(node)
-    if ring and len(ring) >= 3:
-        label = ''
-        if label_key:
-            label = node.get(label_key) or ''
-        else:
-            for lkey in ('name', 'label'):
-                if isinstance(node.get(lkey), str):
-                    label = node[lkey]
-                    break
-        out.append((_class_of(node, default_class, class_key), label, ring))
-        return
-
-    recursed = False
-    for key in _LIST_KEYS:
-        if isinstance(node.get(key), list):
-            _walk(node[key], default_class, class_key, label_key, out)
-            recursed = True
-    if recursed:
-        return
-
-    for key, value in node.items():
-        if isinstance(value, list) and value and isinstance(value[0], dict):
-            # key names the class for everything inside it (the BCNB shape)
-            _walk(value, str(key), class_key, label_key, out)
-        elif isinstance(value, (dict, list)):
-            _walk(value, default_class, class_key, label_key, out)
-
-
-def json_to_annotations(data, base_name, default_class='annotation',
-                        class_key=None, label_key=None, scale=1.0):
-    """Parsed JSON -> list of annotation documents, one per class.
-
-    Raises ValueError if no usable polygons are found anywhere in the document.
+    The vocabulary is read from the collection's ``annotationClasses`` metadata.
+    It is None when the collection has none, which makes the upload warn, and
+    NOT_CHECKED when the item doesn't live in a collection.
     """
-    triples = []
-    _walk(data, default_class, class_key, label_key, triples)
-    if not triples:
-        raise ValueError('No polygons found. Looked for %s under any of %s.'
-                         % ('/'.join(_COORD_KEYS), '/'.join(_LIST_KEYS)))
+    if item.get('baseParentType') != 'collection':
+        return None, annotation_format.NOT_CHECKED
+    from girder.models.collection import Collection
 
-    by_class = {}
-    for class_name, label, ring in triples:
-        by_class.setdefault(class_name, []).append((label, ring))
-
-    docs = []
-    for idx, class_name in enumerate(sorted(by_class)):
-        line_color, fill_color = _ann_colors_for(class_name, idx)
-        elements = []
-        for label, ring in by_class[class_name]:
-            if scale != 1.0:
-                ring = [[c[0] * scale, c[1] * scale] for c in ring]
-            elements.append(_polygon_element(
-                ring, label, class_name, line_color, fill_color))
-        if elements:
-            docs.append({
-                'name': '{} - {}'.format(base_name, class_name),
-                'description': 'Imported annotation ({} regions)'.format(class_name),
-                'elements': elements,
-            })
-    return docs
+    collection = Collection().load(item['baseParentId'], force=True)
+    if not collection:
+        return None, annotation_format.NOT_CHECKED
+    vocabulary = (collection.get('meta') or {}).get('annotationClasses')
+    if not (isinstance(vocabulary, dict) and vocabulary):
+        vocabulary = None
+    return collection['name'], vocabulary
 
 
 # ---------------------------------------------------------------------------
@@ -461,47 +296,41 @@ class DsaCsvResource(Resource):
 
     @access.user
     @autoDescribeRoute(
-        Description('Convert a polygon annotation JSON and attach it to an item '
-                    'as HistomicsUI annotations. The JSON shape is auto-detected '
-                    '(BCNB, BEETLE, GeoJSON, or a flat polygon list); each class '
-                    'found becomes one colored, toggleable annotation layer.')
+        Description('Validate an annotation file in the DSA annotation format (v1) and, '
+                    'if it is valid, attach it to an item as HistomicsUI annotations: one '
+                    'colored, toggleable layer per class. Other formats must be converted '
+                    'first with devops/dsa/utils/convert_annotations.py. The response lists '
+                    'every error and warning found.')
         .modelParam('itemId', 'Target slide item', model=Item,
                     level=AccessType.WRITE, paramType='path')
         .jsonParam('body',
-                   'JSON object with keys: json_content (string, the raw '
-                   'annotation JSON), replace (bool, default false — if true, an '
-                   'existing annotation of the same name is removed first), and '
-                   'optionally class_key / label_key (force which JSON field '
-                   'names the class or the region) and scale (float, multiply '
-                   'every coordinate; default 1)',
+                   'JSON object with keys: json_content (string, the annotation file), '
+                   'replace (bool, default false: remove existing layers of the same name '
+                   'first), validate_only (bool, default false: run every check without '
+                   'writing anything)',
                    paramType='body', requireObject=True)
     )
     def ingest_annotation_json(self, item, body, params):
         from girder_large_image_annotation.models.annotation import Annotation
 
-        raw = body.get('json_content', '')
         replace = bool(body.get('replace', False))
-        try:
-            data = _json.loads(raw)
-        except (ValueError, TypeError) as exc:
-            return {'error': 'Invalid JSON: %s' % exc}
+        validate_only = bool(body.get('validate_only', False))
+        collection_name, vocabulary = _collection_vocabulary(item)
+        report, annotations = annotation_format.prepare_upload(
+            body.get('json_content', ''), slide=_slide_info(item),
+            vocabulary=vocabulary, collection_name=collection_name)
 
-        base_name = item['name'].rsplit('.', 1)[0]
-        try:
-            scale = float(body.get('scale', 1) or 1)
-        except (TypeError, ValueError):
-            return {'error': 'scale must be a number.'}
-        try:
-            docs = json_to_annotations(
-                data, base_name,
-                class_key=body.get('class_key') or None,
-                label_key=body.get('label_key') or None,
-                scale=scale)
-        except ValueError as exc:
-            return {'error': str(exc)}
-
-        if not docs:
-            return {'error': 'No usable annotation regions found in JSON.'}
+        result = report.as_dict()
+        result.update({
+            'item_id': str(item['_id']),
+            'item_name': item['name'],
+            'validate_only': validate_only,
+            'layers': [{'name': a['name'], 'elements': len(a['elements'])} for a in annotations],
+            'annotations_created': [],
+            'skipped_existing': [],
+        })
+        if not report.ok or validate_only:
+            return result
 
         user = self.getCurrentUser()
         existing = {
@@ -510,26 +339,17 @@ class DsaCsvResource(Resource):
                 {'itemId': item['_id']}, user=user, level=AccessType.WRITE)
             if a.get('annotation', {}).get('name')
         }
-
-        created = []
-        for doc in docs:
-            if doc['name'] in existing:
-                if replace:
-                    Annotation().remove(existing[doc['name']])
-                else:
-                    continue  # skip; leave the existing one in place
-            Annotation().createAnnotation(item, user, doc)
-            created.append({'name': doc['name'], 'elements': len(doc['elements'])})
-
-        return {
-            'item_id': str(item['_id']),
-            'item_name': item['name'],
-            'annotations_created': created,
-            'layers': [d['name'] for d in docs],
-            'skipped_existing': [d['name'] for d in docs
-                                 if d['name'] in existing and not replace],
-        }
-
+        for annotation in annotations:
+            name = annotation['name']
+            if name in existing:
+                if not replace:
+                    result['skipped_existing'].append(name)
+                    continue
+                Annotation().remove(existing[name])
+            Annotation().createAnnotation(item, user, annotation)
+            result['annotations_created'].append(
+                {'name': name, 'elements': len(annotation['elements'])})
+        return result
 
 # ---------------------------------------------------------------------------
 # HTML upload page (served at /csv_upload by the plugin __init__)
@@ -1343,6 +1163,16 @@ button{padding:9px 22px;border:none;border-radius:4px;font-size:.95em;cursor:poi
 .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
 .topbar a{font-size:.82em;color:#2980b9;text-decoration:none}
 .topbar a:hover{text-decoration:underline}
+.actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:center}
+.btn-secondary{background:#fff;color:#2980b9;border:1px solid #3498db}
+.btn-secondary:hover{background:#ebf5fb}
+.btn-secondary:disabled{color:#a0bdd8;border-color:#a0bdd8;cursor:default}
+.status{font-size:.85em;color:#7f8c8d;flex-basis:100%;text-align:center;min-height:1.2em}
+.warn{background:#fef5e7;border:1px solid #f8c471;border-radius:4px;padding:14px;color:#9a6700;margin-top:10px}
+.issues{margin:8px 0 0 18px;font-size:.88em;line-height:1.5}
+.issues li{margin:3px 0}
+.issues code,.hint code{font-size:.9em;background:rgba(0,0,0,.06);padding:1px 4px;border-radius:3px}
+.note{font-size:.82em;color:#566573;margin-top:6px}
 </style>
 </head>
 <body>
@@ -1365,7 +1195,7 @@ button{padding:9px 22px;border:none;border-radius:4px;font-size:.95em;cursor:poi
     <h2>2 &nbsp; Target Slide (Item)</h2>
     <label for="itemPath">Item path (optional lookup)</label>
     <div class="row">
-      <input id="itemPath" type="text" placeholder="/collection/BCNB/Images/1.svs">
+      <input id="itemPath" type="text" placeholder="/collection/BEETLE/images/development/wsis/patient1_wsi1.tif">
       <button class="btn-sm" type="button" onclick="lookupItem()">Look up</button>
     </div>
     <p class="hint" id="itemHint">&nbsp;</p>
@@ -1377,12 +1207,14 @@ button{padding:9px 22px;border:none;border-radius:4px;font-size:.95em;cursor:poi
     <h2>3 &nbsp; Annotation JSON</h2>
     <label for="jsonFile">Select JSON file</label>
     <input id="jsonFile" type="file" accept=".json,application/json">
-    <p class="hint">Format is auto-detected: BCNB {&quot;positive&quot;: [{&quot;vertices&quot;: [[x,y],...]}]}, BEETLE [{&quot;coordinates&quot;: [[x,y],...], &quot;label&quot;: {&quot;name&quot;: &quot;...&quot;}}], GeoJSON, or a flat polygon list. Each class found becomes one colored layer.</p>
+    <p class="hint">The file must use the DSA annotation format (<code>dsa-annotation</code> v1). Convert other formats first with <code>utils/convert_annotations.py</code>. Classes are checked against the collection&rsquo;s vocabulary when it has one.</p>
     <label class="chk"><input id="replace" type="checkbox"> Replace existing annotation layers of the same name</label>
   </div>
 
-  <div class="card" style="text-align:center">
-    <button id="submitBtn" class="btn-primary" onclick="run()">Upload &amp; Attach Annotations</button>
+  <div class="card actions">
+    <button id="validateBtn" class="btn-secondary" type="button" onclick="submitAnnotation(true)">Validate only</button>
+    <button id="submitBtn" class="btn-primary" type="button" onclick="submitAnnotation(false)">Validate &amp; upload</button>
+    <span id="status" class="status" aria-live="polite"></span>
   </div>
 
   <div class="card" id="result">
@@ -1426,7 +1258,12 @@ button{padding:9px 22px;border:none;border-radius:4px;font-size:.95em;cursor:poi
     } catch(e) { hint.textContent = 'Error: ' + e.message; }
   };
 
-  window.run = async function() {
+  function setBusy(busy) {
+    document.getElementById('validateBtn').disabled = busy;
+    document.getElementById('submitBtn').disabled = busy;
+  }
+
+  window.submitAnnotation = async function(validateOnly) {
     var apiUrl  = document.getElementById('apiUrl').value.trim();
     var apiKey  = document.getElementById('apiKey').value.trim();
     var itemId  = document.getElementById('itemId').value.trim();
@@ -1436,52 +1273,76 @@ button{padding:9px 22px;border:none;border-radius:4px;font-size:.95em;cursor:poi
     if (!itemId) { alert('Item ID required.'); return; }
     if (!file)   { alert('Select a JSON file.'); return; }
 
-    var btn = document.getElementById('submitBtn');
-    btn.disabled = true; btn.textContent = 'Working...';
+    var status = document.getElementById('status');
+    setBusy(true);
+    status.textContent = validateOnly ? 'Validating…' : 'Validating and uploading…';
     try {
       var token = await getToken(apiUrl, apiKey);
-      var jsonContent = await file.text();
       var r = await fetch(apiUrl + '/dsa_tools/item/' + itemId + '/ingest_annotation_json', {
         method: 'POST',
         headers: {'Content-Type':'application/json','Girder-Token':token},
-        body: JSON.stringify({json_content: jsonContent, replace: replace}),
+        body: JSON.stringify({json_content: await file.text(), replace: replace,
+                              validate_only: validateOnly}),
       });
-      renderResult(r.ok, await r.json(), itemId);
+      var data = await r.json();
+      if (!r.ok) throw new Error(data.message || ('HTTP ' + r.status));
+      renderResult(data, itemId);
     } catch(e) {
-      renderResult(false, {error: e.message}, itemId);
+      show('<div class="err"><strong>Request failed:</strong> ' + esc(e.message) + '</div>');
     } finally {
-      btn.disabled = false; btn.textContent = 'Upload & Attach Annotations';
+      setBusy(false);
+      status.textContent = '';
     }
   };
 
-  function renderResult(ok, data, itemId) {
+  function plural(n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); }
+
+  function issueList(issues) {
+    return '<ul class="issues">' + issues.map(function(i) {
+      return '<li><code>' + esc(i.code) + '</code> ' + esc(i.message) + '</li>';
+    }).join('') + '</ul>';
+  }
+
+  function layerTags(layers) {
+    return layers.map(function(l) {
+      return '<span class="tag">' + esc(l.name) + ' (' + plural(l.elements, 'element') + ')</span>';
+    }).join('');
+  }
+
+  function show(html) {
     var div = document.getElementById('result');
-    var body = document.getElementById('resultBody');
+    document.getElementById('resultBody').innerHTML = html;
     div.style.display = 'block';
-    if (!ok || data.error) {
-      body.innerHTML = '<div class="err"><strong>Error:</strong> ' +
-        esc(data.error || data.message || JSON.stringify(data)) + '</div>';
-      return;
-    }
-    var created = data.annotations_created || [];
-    var html = '<div class="ok"><strong>' + created.length + ' annotation layer(s) attached to ' +
-               esc(data.item_name || '') + '</strong>';
-    if (created.length) {
-      html += '<br><br>';
-      created.forEach(function(c){
-        html += '<span class="tag">' + esc(c.name) + ' (' + c.elements + ' region' +
-                (c.elements===1?'':'s') + ')</span>';
-      });
-    }
-    if (data.skipped_existing && data.skipped_existing.length) {
-      html += '<br><br>Skipped (already present, not replaced): ' +
-              data.skipped_existing.map(esc).join(', ');
-    }
-    html += '<br><br><a class="biglink" href="/histomics#?image=' + encodeURIComponent(itemId) +
-            '" target="_blank" rel="noopener">Open this slide in HistomicsUI to view annotations &rarr;</a>';
-    html += '</div>';
-    body.innerHTML = html;
     div.scrollIntoView({behavior:'smooth'});
+  }
+
+  function renderResult(data, itemId) {
+    var html;
+    if (!data.ok) {
+      html = '<div class="err"><strong>' + plural(data.errors.length, 'problem') +
+             ' found. Nothing was uploaded.</strong>' + issueList(data.errors) + '</div>';
+    } else if (data.validate_only) {
+      html = '<div class="ok"><strong>Valid. Uploading would create ' +
+             plural(data.layers.length, 'layer') + ' on ' + esc(data.item_name) +
+             ':</strong><br><br>' + layerTags(data.layers) + '</div>';
+    } else {
+      var created = data.annotations_created;
+      html = '<div class="ok"><strong>' + plural(created.length, 'layer') + ' attached to ' +
+             esc(data.item_name) + '</strong>';
+      if (created.length) html += '<br><br>' + layerTags(created);
+      if (data.skipped_existing.length) {
+        html += '<br><br>Kept existing layers (tick &ldquo;Replace existing&rdquo; to overwrite): ' +
+                data.skipped_existing.map(esc).join(', ');
+      }
+      html += '<br><br><a class="biglink" href="/histomics#?image=' + encodeURIComponent(itemId) +
+              '" target="_blank" rel="noopener">Open in HistomicsUI &rarr;</a>' +
+              '<p class="note">New layers start hidden: tick them in the Annotations panel.</p></div>';
+    }
+    if (data.warnings && data.warnings.length) {
+      html += '<div class="warn"><strong>' + plural(data.warnings.length, 'warning') + '</strong>' +
+              issueList(data.warnings) + '</div>';
+    }
+    show(html);
   }
 
   function esc(s) {
