@@ -184,14 +184,18 @@ def main():
 
     step('read back from Girder')
     stored = gc.get('annotation', parameters={'itemId': item_id, 'limit': 0})
-    names = sorted(a['annotation']['name'] for a in stored)
+    ours = [a for a in stored if a['annotation']['name'] in layers]
+    others = [a['annotation']['name'] for a in stored if a['annotation']['name'] not in layers]
+    if others:
+        print('  (left untouched, not part of this test: %s)' % ', '.join(others))
+    names = sorted(a['annotation']['name'] for a in ours)
     check(names == sorted(layers), 'stored layers match (%s)' % ', '.join(names))
     inside = True
-    for a in stored:
+    for a in ours:
         full = gc.get('annotation/%s' % a['_id'])
         elements = full['annotation']['elements']
-        xs = [p[0] for e in elements for p in e.get('points', [])]
-        ys = [p[1] for e in elements for p in e.get('points', [])]
+        xs = [p[0] for e in elements for p in e.get('points', [e.get('center')]) if p]
+        ys = [p[1] for e in elements for p in e.get('points', [e.get('center')]) if p]
         hole_count = sum(len(e.get('holes', [])) for e in elements)
         print('  %-45s %5d elements  x %.0f..%.0f  y %.0f..%.0f  holes %d  color %s'
               % (full['annotation']['name'], len(elements), min(xs), max(xs), min(ys), max(ys),
