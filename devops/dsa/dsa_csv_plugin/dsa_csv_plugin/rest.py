@@ -1186,9 +1186,10 @@ button{padding:9px 22px;border:none;border-radius:4px;font-size:.95em;cursor:poi
     <h2>1 &nbsp; Connection</h2>
     <label for="apiUrl">Girder API URL</label>
     <input id="apiUrl" type="text" placeholder="http://localhost:8080/api/v1">
-    <label for="apiKey">API Key</label>
-    <input id="apiKey" type="password" placeholder="Paste your Girder API key">
-    <p class="hint">Generate a key: Girder UI &rarr; top-right user menu &rarr; My Account &rarr; API keys.</p>
+    <p id="session" class="note" aria-live="polite">Checking whether you are signed in&hellip;</p>
+    <label for="apiKey">API key <span class="note" style="font-weight:400">(only needed if you are not signed in)</span></label>
+    <input id="apiKey" type="password" placeholder="Paste a Girder API key" autocomplete="off">
+    <p class="hint">Signed in to Girder in this browser? Leave this empty. Otherwise generate a key: Girder UI &rarr; top-right user menu &rarr; My Account &rarr; API keys.</p>
   </div>
 
   <div class="card">
@@ -1229,12 +1230,48 @@ button{padding:9px 22px;border:none;border-radius:4px;font-size:.95em;cursor:poi
   var qs = new URLSearchParams(window.location.search);
   if (qs.get('itemId')) document.getElementById('itemId').value = qs.get('itemId');
 
-  async function getToken(apiUrl, apiKey) {
-    var r = await fetch(apiUrl + '/api_key/token?key=' + encodeURIComponent(apiKey) + '&duration=1',
-                        {method:'POST'});
-    if (!r.ok) throw new Error('Auth failed: ' + await r.text());
-    return (await r.json()).authToken.token;
+  // Girder's own web app keeps the login token in localStorage (older
+  // versions used a cookie). The page is served from the same origin, so a
+  // browser that is signed in to Girder can reuse that login here.
+  function sessionToken() {
+    try {
+      var t = window.localStorage.getItem('girderToken');
+      if (t) return t;
+    } catch (e) {}
+    var m = document.cookie.match(/(?:^|;\\s*)girderToken=([^;]+)/);
+    return m ? decodeURIComponent(m[1]) : null;
   }
+
+  async function getToken(apiUrl, apiKey) {
+    if (apiKey) {
+      var r = await fetch(apiUrl + '/api_key/token?key=' + encodeURIComponent(apiKey) + '&duration=1',
+                          {method:'POST'});
+      if (!r.ok) throw new Error('API key rejected: ' + await r.text());
+      return (await r.json()).authToken.token;
+    }
+    var token = sessionToken();
+    if (!token) throw new Error('Not signed in. Sign in to Girder in another tab and reload this page, or paste an API key.');
+    return token;
+  }
+
+  async function showSession(apiUrl) {
+    var el = document.getElementById('session');
+    var token = sessionToken();
+    if (!token) {
+      el.innerHTML = 'Not signed in. <a href="/" target="_blank" rel="noopener">Sign in to Girder</a>, then reload this page, or paste an API key below.';
+      return;
+    }
+    try {
+      var r = await fetch(apiUrl + '/user/me', {headers: {'Girder-Token': token}});
+      var me = r.ok ? await r.json() : null;
+      if (me && me.login) {
+        el.textContent = 'Signed in as ' + me.login + '. No API key needed.';
+        return;
+      }
+    } catch (e) {}
+    el.innerHTML = 'Your Girder sign-in has expired. <a href="/" target="_blank" rel="noopener">Sign in again</a> and reload, or paste an API key below.';
+  }
+  showSession(document.getElementById('apiUrl').value);
 
   window.lookupItem = async function() {
     var apiUrl = document.getElementById('apiUrl').value.trim();
@@ -1244,7 +1281,7 @@ button{padding:9px 22px;border:none;border-radius:4px;font-size:.95em;cursor:poi
     if (!path) { hint.textContent = 'Enter a path first.'; return; }
     try {
       var headers = {};
-      if (apiKey) headers['Girder-Token'] = await getToken(apiUrl, apiKey);
+      try { headers['Girder-Token'] = await getToken(apiUrl, apiKey); } catch (e) {}
       var r = await fetch(apiUrl + '/resource/lookup?path=' + encodeURIComponent(path), {headers:headers});
       if (!r.ok) throw new Error(await r.text());
       var doc = await r.json();
@@ -1269,7 +1306,6 @@ button{padding:9px 22px;border:none;border-radius:4px;font-size:.95em;cursor:poi
     var itemId  = document.getElementById('itemId').value.trim();
     var replace = document.getElementById('replace').checked;
     var file    = document.getElementById('jsonFile').files[0];
-    if (!apiKey) { alert('API key required.'); return; }
     if (!itemId) { alert('Item ID required.'); return; }
     if (!file)   { alert('Select a JSON file.'); return; }
 
