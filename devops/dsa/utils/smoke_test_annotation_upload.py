@@ -66,6 +66,25 @@ def api_key():
     return key
 
 
+def find_items(gc, name):
+    """Every item called ``name`` in any collection.
+
+    Lists items rather than using resource/search: Girder's text search
+    tokenizes names, and ``patient1_wsi1.tif`` doesn't match itself there.
+    """
+    found = []
+    for collection in gc.get('collection', parameters={'limit': 0}):
+        offset = 0
+        while True:
+            page = gc.get('resource/%s/items' % collection['_id'],
+                          parameters={'type': 'collection', 'limit': 500, 'offset': offset})
+            found.extend(i for i in page if i['name'] == name)
+            if len(page) < 500:
+                break
+            offset += 500
+    return found
+
+
 def upload(gc, item_id, text, **options):
     body = dict({'json_content': text}, **options)
     return gc.post('dsa_tools/item/%s/ingest_annotation_json' % item_id, json=body)
@@ -85,8 +104,7 @@ def main():
     check(me is not None, 'API key authenticates (user %s)' % (me or {}).get('login'))
 
     step('find the slide')
-    hits = gc.get('resource/search', parameters={'q': SLIDE, 'types': json.dumps(['item'])})
-    items = [i for i in hits.get('item', []) if i['name'] == SLIDE]
+    items = find_items(gc, SLIDE)
     wsis = [i for i in items if gc.get('folder/%s' % i['folderId'])['name'] == 'wsis']
     if not check(len(wsis) == 1, 'exactly one %s under a "wsis" folder (found %d, %d total same-name)'
                  % (SLIDE, len(wsis), len(items))):
