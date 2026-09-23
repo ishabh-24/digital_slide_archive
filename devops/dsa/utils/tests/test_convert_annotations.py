@@ -10,7 +10,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, os.pardir))
 
 import convert_annotations as ca  # noqa: E402
-import annotation_format as af  # noqa: E402  (importable via convert_annotations' path setup)
+from dsa_csv_plugin import annotation_format as af  # noqa: E402  (path set up by convert_annotations)
 import validate_annotation  # noqa: E402
 
 FIXTURE = os.path.join(HERE, 'fixtures', 'beetle_patient104_wsi1_excerpt.json')
@@ -33,7 +33,8 @@ def convert(path, source='beetle', **kwargs):
 def test_beetle_excerpt_converts_to_a_valid_document():
     doc, notes = convert(FIXTURE)
     assert af.validate(doc).issues == []
-    assert notes == {'features': 4, 'dropped': 0, 'clipped': 0}
+    assert notes == {'features': 4, 'dropped': 0, 'clipped': 0,
+                     'classes': ['non-invasive epithelium', 'other']}
     assert doc['properties']['slide'] == {'name': 'patient104_wsi1.tif'}
     assert doc['properties']['classes'] == {
         'non-invasive epithelium': {'description': 'BEETLE label value 2'},

@@ -1,7 +1,7 @@
 {
   "name": "@girder/dsa_csv",
   "version": "0.1.0",
-  "description": "Adds a Filter Slides button to the Girder folder view.",
+  "description": "Adds a Filter Slides folder button and an Annotation Tools navigation entry to Girder.",
   "license": "Apache-2.0",
   "main": "./index.js",
   "peerDependencies": {

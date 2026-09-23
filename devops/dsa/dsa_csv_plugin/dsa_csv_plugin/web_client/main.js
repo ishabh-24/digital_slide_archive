@@ -1,7 +1,9 @@
 import { registerPluginNamespace } from '@girder/core/pluginUtils';
 
-// Import for side effects: injects the "Filter Slides" button into the folder view.
+// Imports for side effects: the "Filter Slides" folder button and the
+// "Annotation Tools" entry in the top navigation.
 import './views/HierarchyWidget';
+import './views/GlobalNav';
 
 import * as dsaCsv from './index';
 

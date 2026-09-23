@@ -23,9 +23,9 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'dsa_csv_plugin' / 'dsa_csv_plugin'))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'dsa_csv_plugin'))
 
-import annotation_format  # noqa: E402
+from dsa_csv_plugin import annotation_format  # noqa: E402
 
 
 def _size(text):

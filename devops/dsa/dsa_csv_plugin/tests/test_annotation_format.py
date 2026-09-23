@@ -4,12 +4,11 @@ import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, os.pardir, 'dsa_csv_plugin'))
+sys.path.insert(0, os.path.join(HERE, os.pardir))
 
-import annotation_format as af  # noqa: E402
+from dsa_csv_plugin import annotation_format as af  # noqa: E402
 
-DSA_DIR = os.path.abspath(os.path.join(HERE, os.pardir, os.pardir))
-EXAMPLE = os.path.join(DSA_DIR, 'annotation_format', 'example-beetle-patient104_wsi1.json')
+EXAMPLE = os.path.join(HERE, os.pardir, 'dsa_csv_plugin', 'docs', 'example-beetle-patient104_wsi1.json')
 SETUP_CFG = os.path.join(HERE, os.pardir, 'setup.cfg')
 
 SQUARE = [[0, 0], [100, 0], [100, 100], [0, 100], [0, 0]]

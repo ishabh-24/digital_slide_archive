@@ -1,16 +1,22 @@
 # DSA Annotation Format — v1 (draft)
 
-Status: **draft, team decisions applied**. Nothing in the platform enforces this yet.
+Status: **v1, enforced**. The upload page accepts only files in this format.
 
 One file holds the annotations for **one whole-slide image**. The format is a
 constrained profile of GeoJSON (RFC 7946): every valid file is ordinary GeoJSON,
 but not every GeoJSON file is valid here. Bulk uploads pair files with slides
 through a manifest, as `utils/ingest_annotations.py` does today.
 
-- Schema: [`dsa-annotation-v1.schema.json`](../dsa_csv_plugin/dsa_csv_plugin/schemas/dsa-annotation-v1.schema.json) (inside the plugin package so the upload route can load it)
-- Validator: [`annotation_format.py`](../dsa_csv_plugin/dsa_csv_plugin/annotation_format.py); command line: [`utils/validate_annotation.py`](../utils/validate_annotation.py)
-- Converter: [`utils/convert_annotations.py`](../utils/convert_annotations.py)
-- Example: [`example-beetle-patient104_wsi1.json`](example-beetle-patient104_wsi1.json)
+In the platform (top navigation → **Annotation Tools**):
+
+- **Upload & validate** a file: `/annotation_upload`
+- **Convert** a BEETLE or BCNB file to this format: `/annotation_convert`
+- **This specification**: `/annotation_format` · schema: `/dsa_tools/annotation_schema` · example file: `/dsa_tools/annotation_example`
+
+In the repository (`devops/dsa/`): schema `dsa_csv_plugin/dsa_csv_plugin/schemas/dsa-annotation-v1.schema.json`,
+validator `dsa_csv_plugin/dsa_csv_plugin/annotation_format.py`, converters
+`dsa_csv_plugin/dsa_csv_plugin/converters.py`, command-line tools `utils/validate_annotation.py`
+and `utils/convert_annotations.py` (adds an `auto` adapter), example `dsa_csv_plugin/dsa_csv_plugin/docs/example-beetle-patient104_wsi1.json`.
 
 ## Minimal file
 
@@ -170,8 +176,8 @@ converted file always passes the schema layer. Lenient format guessing lives onl
 
 | Source | Adapter | State |
 |---|---|---|
-| BEETLE JSON (`[{coordinates, label:{name,value}}]`) | `beetle` | Logic exists in `utils/ingest_annotations.py`; re-target output |
-| BCNB JSON (`{class: [{vertices}]}`) | `bcnb` | Logic exists; re-target output |
+| BEETLE JSON (`[{coordinates, label:{name,value}}]`) | `beetle` | Done: `/annotation_convert` and the command line |
+| BCNB JSON (`{class: [{vertices}]}`) | `bcnb` | Done: `/annotation_convert` and the command line |
 | QuPath GeoJSON export (regions and cell detections) | `qupath-geojson` | Small: move `classification.name` into `class`, build `classes` |
 | ASAP XML (BEETLE `annotations/xmls/`, CAMELYON) | `asap-xml` | New |
 | Raster label masks | `mask` | New, hardest: contour tracing plus scaling from mask µm/px to level 0 |
@@ -190,10 +196,8 @@ converted file always passes the schema layer. Lenient format guessing lives onl
 
 ## Still open
 
-1. **Confirm holes on the running server**, not just in source: the image's
-   large_image layer is cached from whenever it was first built.
-2. **Where admins edit the vocabulary**: a small page like `/csv_upload`, or set
+1. **Where admins edit the vocabulary**: a small page like `/csv_upload`, or set
    through the API only for now.
-3. **Default palette with more than two classes**: black/white alternation means
+2. **Default palette with more than two classes**: black/white alternation means
    the third class looks like the first. Acceptable, or should vocabulary colors be
    required once a collection has three or more classes?

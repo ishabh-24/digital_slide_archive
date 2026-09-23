@@ -1,4 +1,7 @@
-from girder.plugin import GirderPlugin
+try:
+    from girder.plugin import GirderPlugin
+except ImportError:  # the offline tools import this package without Girder installed
+    GirderPlugin = object
 
 
 class DsaCsvPlugin(GirderPlugin):
@@ -7,7 +10,8 @@ class DsaCsvPlugin(GirderPlugin):
 
     def load(self, info):
         import cherrypy
-        from .rest import (DsaCsvResource, get_annotation_html, get_filter_html,
+        from .rest import (DsaCsvResource, get_annotation_html, get_convert_html,
+                           get_filter_html, get_format_html, get_tools_html,
                            get_upload_html)
 
         info['apiRoot'].dsa_tools = DsaCsvResource()
@@ -27,3 +31,6 @@ class DsaCsvPlugin(GirderPlugin):
         info['serverRoot'].csv_upload = _HtmlPage(get_upload_html)
         info['serverRoot'].slidefilter = _HtmlPage(get_filter_html)
         info['serverRoot'].annotation_upload = _HtmlPage(get_annotation_html)
+        info['serverRoot'].annotation_tools = _HtmlPage(get_tools_html)
+        info['serverRoot'].annotation_convert = _HtmlPage(get_convert_html)
+        info['serverRoot'].annotation_format = _HtmlPage(get_format_html)

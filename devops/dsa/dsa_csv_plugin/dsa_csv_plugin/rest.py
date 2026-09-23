@@ -13,7 +13,7 @@ from girder.models.folder import Folder
 from girder.models.item import Item
 from girder.models.upload import Upload
 
-from . import annotation_format
+from . import annotation_format, converters, docs_page
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +166,9 @@ class DsaCsvResource(Resource):
         self.route('GET', ('folder', ':folderId', 'slide_meta'), self.slide_meta)
         self.route('POST', ('item', ':itemId', 'ingest_annotation_json'),
                    self.ingest_annotation_json)
+        self.route('POST', ('convert_annotation',), self.convert_annotation)
+        self.route('GET', ('annotation_schema',), self.annotation_schema)
+        self.route('GET', ('annotation_example',), self.annotation_example)
 
     @access.public
     @autoDescribeRoute(
@@ -351,6 +354,52 @@ class DsaCsvResource(Resource):
                 {'name': name, 'elements': len(annotation['elements'])})
         return result
 
+    @access.user
+    @autoDescribeRoute(
+        Description('Convert a dataset-specific annotation file (BEETLE or BCNB) into the '
+                    'DSA annotation format (v1). Nothing is stored: the converted document '
+                    'is returned for download and later upload. The result has already '
+                    'passed the format validator.')
+        .jsonParam('body',
+                   'JSON object with keys: source_format (one of: %s), json_content '
+                   '(string, the source file), slide_name (string, the slide file these '
+                   'annotations belong to, with extension), clip_negative (bool, default '
+                   'false: clamp negative coordinates to 0 instead of failing)'
+                   % ', '.join(sorted(converters.ADAPTERS)),
+                   paramType='body', requireObject=True)
+    )
+    def convert_annotation(self, body, params):
+        slide_name = (body.get('slide_name') or '').strip()
+        if not slide_name:
+            return {'ok': False, 'error': 'slide_name is required: the slide file these '
+                                          'annotations belong to, e.g. patient1_wsi1.tif'}
+        try:
+            document, notes = converters.convert_text(
+                body.get('json_content', ''), body.get('source_format', ''), slide_name,
+                body.get('source_file') or 'uploaded file',
+                clip_negative=bool(body.get('clip_negative', False)),
+                converter='annotation_convert page (%s)' % converters.CONVERTER)
+        except converters.AdapterError as exc:
+            return {'ok': False, 'error': str(exc)}
+        return {'ok': True, 'document': document, 'notes': notes,
+                'suggested_filename': '%s.dsa.json' % slide_name.rsplit('.', 1)[0]}
+
+    @access.public
+    @autoDescribeRoute(
+        Description('The JSON Schema for the DSA annotation format (v1).')
+    )
+    def annotation_schema(self, params):
+        with open(annotation_format.SCHEMA_PATH, encoding='utf-8') as handle:
+            return _json.load(handle)
+
+    @access.public
+    @autoDescribeRoute(
+        Description('A small valid example file in the DSA annotation format (v1), '
+                    'taken from BEETLE.')
+    )
+    def annotation_example(self, params):
+        return _json.loads(docs_page.example_json())
+
 # ---------------------------------------------------------------------------
 # HTML upload page (served at /csv_upload by the plugin __init__)
 # ---------------------------------------------------------------------------
@@ -361,6 +410,22 @@ def get_upload_html():
 
 def get_filter_html():
     return _FILTER_HTML
+
+
+def get_tools_html():
+    return _TOOLS_HTML
+
+
+def get_convert_html():
+    options = ''.join(
+        '<option value="%s">%s</option>' % (key, docs_page.html.escape(label))
+        for key, label in sorted(converters.ADAPTER_DESCRIPTIONS.items()))
+    return _CONVERT_HTML.replace('<!--FORMAT_OPTIONS-->', options)
+
+
+def get_format_html():
+    return _FORMAT_HTML.replace('<!--SPEC_BODY-->',
+                                docs_page.render_markdown(docs_page.spec_markdown()))
 
 
 def get_annotation_html():
@@ -1387,5 +1452,304 @@ button{padding:9px 22px;border:none;border-radius:4px;font-size:.95em;cursor:poi
   }
 })();
 </script>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
+# Annotation Tools pages: landing, converter, format specification
+# ---------------------------------------------------------------------------
+
+_TOOLS_CSS = """
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+     background:#f0f2f5;color:#333;padding:32px 16px;line-height:1.5}
+.wrap{max-width:820px;margin:0 auto}
+.topbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+h1{font-size:1.35em;color:#1a3a5c}
+.topbar a,.links a{font-size:.85em;color:#2980b9;text-decoration:none}
+.topbar a:hover,.links a:hover{text-decoration:underline}
+.card{background:#fff;border-radius:8px;padding:22px 24px;margin-bottom:16px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+.card h2{font-size:1.02em;color:#1a3a5c;margin-bottom:6px}
+.card p{font-size:.92em;color:#555;margin-bottom:10px}
+.card .go{display:inline-block;background:#3498db;color:#fff;padding:8px 18px;border-radius:4px;text-decoration:none;font-size:.92em}
+.card .go:hover{background:#2980b9}
+.links{font-size:.9em;color:#555}
+.links a{margin-right:14px}
+label{display:block;font-size:.85em;font-weight:600;color:#555;margin-bottom:4px}
+input,select{width:100%;padding:8px 10px;border:1px solid #d1d5db;border-radius:4px;font-size:.95em;margin-bottom:12px}
+input:focus,select:focus{outline:none;border-color:#3498db}
+.hint{font-size:.78em;color:#7f8c8d;margin-top:-8px;margin-bottom:12px}
+.chk{display:flex;align-items:center;gap:8px;font-size:.85em;color:#555}
+.chk input{width:auto;margin:0}
+button{padding:9px 22px;border:none;border-radius:4px;font-size:.95em;cursor:pointer}
+.btn-primary{background:#3498db;color:#fff}
+.btn-primary:hover{background:#2980b9}
+.btn-primary:disabled{background:#a0bdd8;cursor:default}
+.actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.status{font-size:.85em;color:#7f8c8d}
+#result{display:none}
+.ok{background:#eafaf1;border:1px solid #a9dfbf;border-radius:4px;padding:14px;color:#1e8449}
+.err{background:#fdedec;border:1px solid #f5b7b1;border-radius:4px;padding:14px;color:#922b21}
+.tag{display:inline-block;background:#ebf5fb;color:#2471a3;border-radius:3px;padding:2px 7px;margin:2px;font-size:.8em;font-family:monospace}
+.note{font-size:.82em;color:#566573;margin-top:6px}
+code{font-size:.9em;background:rgba(0,0,0,.06);padding:1px 4px;border-radius:3px}
+"""
+
+_TOOLS_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DSA &mdash; Annotation Tools</title>
+<style>""" + _TOOLS_CSS + """</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <h1>Annotation Tools</h1>
+    <a href="/">&larr; Back to Girder</a>
+  </div>
+
+  <div class="card">
+    <h2>Upload &amp; validate</h2>
+    <p>Attach a file in the DSA annotation format to a slide. <strong>Validate only</strong> runs every check
+       (schema, geometry, class vocabulary, image bounds) without writing anything; <strong>Validate &amp; upload</strong>
+       creates one toggleable layer per class in HistomicsUI.</p>
+    <a class="go" href="/annotation_upload">Open upload &amp; validate</a>
+  </div>
+
+  <div class="card">
+    <h2>Convert to the standard format</h2>
+    <p>Turn a BEETLE or BCNB annotation file into a <code>.dsa.json</code> file that the upload accepts.
+       The result is validated before you download it. For whole datasets, use
+       <code>devops/dsa/utils/convert_annotations.py</code> with the dataset&rsquo;s manifest.</p>
+    <a class="go" href="/annotation_convert">Open converter</a>
+  </div>
+
+  <div class="card">
+    <h2>Format specification</h2>
+    <p>What a valid file looks like, every validation code with its message, and how a file becomes
+       HistomicsUI layers.</p>
+    <a class="go" href="/annotation_format">Read the specification</a>
+    <p class="links" style="margin-top:12px">
+      <a href="/dsa_tools/annotation_schema" target="_blank" rel="noopener">JSON Schema</a>
+      <a href="/dsa_tools/annotation_example" target="_blank" rel="noopener">Example file</a>
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>Other tools</h2>
+    <p class="links">
+      <a href="/csv_upload">CSV metadata import</a>
+      <a href="/slidefilter">Browse &amp; filter slides</a>
+      <a href="/histomics" target="_blank" rel="noopener">HistomicsUI</a>
+    </p>
+  </div>
+</div>
+</body>
+</html>"""
+
+_CONVERT_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DSA &mdash; Convert Annotations</title>
+<style>""" + _TOOLS_CSS + """</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <h1>Convert annotations to the DSA format</h1>
+    <a href="/annotation_tools">&larr; Annotation Tools</a>
+  </div>
+
+  <div class="card">
+    <p id="session" class="note" aria-live="polite">Checking whether you are signed in&hellip;</p>
+    <label for="apiKey">API key <span class="note" style="font-weight:400">(only needed if you are not signed in)</span></label>
+    <input id="apiKey" type="password" placeholder="Paste a Girder API key" autocomplete="off">
+  </div>
+
+  <div class="card">
+    <label for="sourceFormat">Source format</label>
+    <select id="sourceFormat"><!--FORMAT_OPTIONS--></select>
+    <label for="sourceFile">Source file</label>
+    <input id="sourceFile" type="file" accept=".json,application/json">
+    <label for="slideName">Slide file these annotations belong to</label>
+    <input id="slideName" type="text" placeholder="patient1_wsi1.tif" autocomplete="off">
+    <p class="hint">Filled in from the source file&rsquo;s name; fix the extension if the slide is not a .tif.</p>
+    <label class="chk"><input id="clipNegative" type="checkbox"> Clamp negative coordinates to 0 instead of failing the file</label>
+  </div>
+
+  <div class="card actions">
+    <button id="convertBtn" class="btn-primary" type="button" onclick="convert()">Convert</button>
+    <span id="status" class="status" aria-live="polite"></span>
+  </div>
+
+  <div class="card" id="result">
+    <h2>Result</h2>
+    <div id="resultBody"></div>
+  </div>
+</div>
+
+<script>
+(function(){
+  var apiUrl = window.location.origin + '/api/v1';
+  var converted = null;
+
+  function sessionToken() {
+    try {
+      var t = window.localStorage.getItem('girderToken');
+      if (t) return t;
+    } catch (e) {}
+    var m = document.cookie.match(/(?:^|;\\s*)girderToken=([^;]+)/);
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+
+  async function getToken(apiKey) {
+    if (apiKey) {
+      var r = await fetch(apiUrl + '/api_key/token?key=' + encodeURIComponent(apiKey) + '&duration=1',
+                          {method:'POST'});
+      if (!r.ok) throw new Error('API key rejected: ' + await r.text());
+      return (await r.json()).authToken.token;
+    }
+    var token = sessionToken();
+    if (!token) throw new Error('Not signed in. Sign in to Girder in another tab and reload this page, or paste an API key.');
+    return token;
+  }
+
+  async function showSession() {
+    var el = document.getElementById('session');
+    var token = sessionToken();
+    if (!token) {
+      el.innerHTML = 'Not signed in. <a href="/" target="_blank" rel="noopener">Sign in to Girder</a>, then reload this page, or paste an API key below.';
+      return;
+    }
+    try {
+      var r = await fetch(apiUrl + '/user/me', {headers: {'Girder-Token': token}});
+      var me = r.ok ? await r.json() : null;
+      if (me && me.login) { el.textContent = 'Signed in as ' + me.login + '. No API key needed.'; return; }
+    } catch (e) {}
+    el.innerHTML = 'Your Girder sign-in has expired. <a href="/" target="_blank" rel="noopener">Sign in again</a> and reload, or paste an API key below.';
+  }
+  showSession();
+
+  document.getElementById('sourceFile').addEventListener('change', function () {
+    var f = this.files[0];
+    var name = document.getElementById('slideName');
+    if (f && !name.value) name.value = f.name.replace(/\\.json$/i, '') + '.tif';
+  });
+
+  function esc(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+  function show(html) {
+    var div = document.getElementById('result');
+    document.getElementById('resultBody').innerHTML = html;
+    div.style.display = 'block';
+    div.scrollIntoView({behavior:'smooth'});
+  }
+  function plural(n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); }
+
+  window.downloadConverted = function () {
+    if (!converted) return;
+    var blob = new Blob([JSON.stringify(converted.document)], {type: 'application/json'});
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = converted.suggested_filename;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(a.href); }, 1000);
+  };
+
+  window.convert = async function () {
+    var file = document.getElementById('sourceFile').files[0];
+    var slideName = document.getElementById('slideName').value.trim();
+    if (!file) { alert('Choose a source file.'); return; }
+    if (!slideName) { alert('Enter the slide filename these annotations belong to.'); return; }
+    var btn = document.getElementById('convertBtn');
+    var status = document.getElementById('status');
+    btn.disabled = true; status.textContent = 'Converting…';
+    try {
+      var token = await getToken(document.getElementById('apiKey').value.trim());
+      var r = await fetch(apiUrl + '/dsa_tools/convert_annotation', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json','Girder-Token':token},
+        body: JSON.stringify({
+          source_format: document.getElementById('sourceFormat').value,
+          json_content: await file.text(),
+          slide_name: slideName,
+          source_file: file.name,
+          clip_negative: document.getElementById('clipNegative').checked,
+        }),
+      });
+      var data = await r.json();
+      if (!r.ok) throw new Error(data.message || ('HTTP ' + r.status));
+      if (!data.ok) {
+        converted = null;
+        show('<div class="err"><strong>Could not convert:</strong> ' + esc(data.error) + '</div>');
+        return;
+      }
+      converted = data;
+      var n = data.notes;
+      var html = '<div class="ok"><strong>Converted: ' + plural(n.features, 'region') + ' in ' +
+                 plural(n.classes.length, 'class') + '.</strong><br><br>' +
+                 n.classes.map(function(c){ return '<span class="tag">' + esc(c) + '</span>'; }).join('');
+      var extra = [];
+      if (n.dropped) extra.push(plural(n.dropped, 'region') + ' with fewer than 3 distinct vertices dropped');
+      if (n.clipped) extra.push(plural(n.clipped, 'negative coordinate') + ' clamped to 0');
+      if (extra.length) html += '<p class="note">' + esc(extra.join('; ')) + '.</p>';
+      html += '<br><div class="actions"><button class="btn-primary" type="button" onclick="downloadConverted()">Download ' +
+              esc(data.suggested_filename) + '</button>' +
+              '<a href="/annotation_upload">Then upload it to a slide &rarr;</a></div></div>';
+      show(html);
+    } catch (e) {
+      converted = null;
+      show('<div class="err"><strong>Request failed:</strong> ' + esc(e.message) + '</div>');
+    } finally {
+      btn.disabled = false; status.textContent = '';
+    }
+  };
+})();
+</script>
+</body>
+</html>"""
+
+_FORMAT_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DSA &mdash; Annotation Format</title>
+<style>""" + _TOOLS_CSS + """
+.spec{background:#fff;border-radius:8px;padding:28px 32px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+.spec h1{font-size:1.5em;margin:0 0 12px}
+.spec h2{font-size:1.15em;color:#1a3a5c;margin:28px 0 8px;padding-top:12px;border-top:1px solid #e5e8ec}
+.spec h3{font-size:.95em;color:#34495e;margin:18px 0 6px}
+.spec p{margin:0 0 10px;font-size:.95em}
+.spec ul,.spec ol{margin:0 0 12px 22px;font-size:.95em}
+.spec li{margin:3px 0}
+.spec pre{background:#f6f8fa;border:1px solid #e5e8ec;border-radius:6px;padding:12px 14px;overflow-x:auto;margin:0 0 14px;font-size:.85em;line-height:1.45}
+.spec pre code{background:none;padding:0;font-size:1em}
+.spec table{border-collapse:collapse;width:100%;margin:0 0 14px;font-size:.88em}
+.spec th,.spec td{text-align:left;vertical-align:top;padding:7px 9px;border-bottom:1px solid #e5e8ec}
+.spec th{background:#f6f8fa;font-weight:600;color:#555}
+.spec .tablewrap{overflow-x:auto}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <h1>Annotation format</h1>
+    <span class="links">
+      <a href="/annotation_tools">&larr; Annotation Tools</a>
+      <a href="/dsa_tools/annotation_schema" target="_blank" rel="noopener">JSON Schema</a>
+      <a href="/dsa_tools/annotation_example" target="_blank" rel="noopener">Example file</a>
+    </span>
+  </div>
+  <div class="spec">
+<!--SPEC_BODY-->
+  </div>
+</div>
 </body>
 </html>"""
