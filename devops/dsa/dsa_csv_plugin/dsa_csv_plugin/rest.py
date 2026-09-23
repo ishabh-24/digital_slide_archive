@@ -2,18 +2,19 @@
 import csv as _csv
 import io
 import json as _json
+import os
 
 import cherrypy
 
 from girder.api import access
 from girder.api.describe import Description, autoDescribeRoute
-from girder.api.rest import Resource
+from girder.api.rest import Resource, RestException
 from girder.constants import AccessType
 from girder.models.folder import Folder
 from girder.models.item import Item
 from girder.models.upload import Upload
 
-from . import annotation_format, converters, docs_page
+from . import annotation_format, converters, docs_page, server_files
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +135,24 @@ def _slide_info(item):
     return info
 
 
+def _source_text(body):
+    """The annotation file's text: uploaded in ``json_content``, or read from
+    ``server_path`` (a .json file under the allowed roots on the server)."""
+    server_path = (body.get('server_path') or '').strip()
+    if server_path:
+        try:
+            return server_files.read_source_file(server_path)
+        except ValueError as exc:
+            raise RestException(str(exc))
+        except OSError as exc:
+            raise RestException('could not read %s: %s' % (server_path, exc.strerror))
+    text = body.get('json_content')
+    if not text:
+        raise RestException('Provide json_content (the file contents) or server_path '
+                            '(a .json file on the server).')
+    return text
+
+
 def _collection_vocabulary(item):
     """``(collection name, class vocabulary)`` for the collection holding an item.
 
@@ -169,6 +188,7 @@ class DsaCsvResource(Resource):
         self.route('POST', ('convert_annotation',), self.convert_annotation)
         self.route('GET', ('annotation_schema',), self.annotation_schema)
         self.route('GET', ('annotation_example',), self.annotation_example)
+        self.route('GET', ('annotation_source_roots',), self.annotation_source_roots)
 
     @access.public
     @autoDescribeRoute(
@@ -307,10 +327,12 @@ class DsaCsvResource(Resource):
         .modelParam('itemId', 'Target slide item', model=Item,
                     level=AccessType.WRITE, paramType='path')
         .jsonParam('body',
-                   'JSON object with keys: json_content (string, the annotation file), '
-                   'replace (bool, default false: remove existing layers of the same name '
-                   'first), validate_only (bool, default false: run every check without '
-                   'writing anything)',
+                   'JSON object with keys: json_content (string, the annotation file) or '
+                   'server_path (string, a .json file on the server under the allowed '
+                   'roots; see GET dsa_tools/annotation_source_roots), replace (bool, '
+                   'default false: remove existing layers of the same name first), '
+                   'validate_only (bool, default false: run every check without writing '
+                   'anything)',
                    paramType='body', requireObject=True)
     )
     def ingest_annotation_json(self, item, body, params):
@@ -320,7 +342,7 @@ class DsaCsvResource(Resource):
         validate_only = bool(body.get('validate_only', False))
         collection_name, vocabulary = _collection_vocabulary(item)
         report, annotations = annotation_format.prepare_upload(
-            body.get('json_content', ''), slide=_slide_info(item),
+            _source_text(body), slide=_slide_info(item),
             vocabulary=vocabulary, collection_name=collection_name)
 
         result = report.as_dict()
@@ -362,7 +384,8 @@ class DsaCsvResource(Resource):
                     'passed the format validator.')
         .jsonParam('body',
                    'JSON object with keys: source_format (one of: %s), json_content '
-                   '(string, the source file), slide_name (string, the slide file these '
+                   '(string, the source file) or server_path (string, a .json file on the '
+                   'server under the allowed roots), slide_name (string, the slide file these '
                    'annotations belong to, with extension), clip_negative (bool, default '
                    'false: clamp negative coordinates to 0 instead of failing)'
                    % ', '.join(sorted(converters.ADAPTERS)),
@@ -375,8 +398,8 @@ class DsaCsvResource(Resource):
                                           'annotations belong to, e.g. patient1_wsi1.tif'}
         try:
             document, notes = converters.convert_text(
-                body.get('json_content', ''), body.get('source_format', ''), slide_name,
-                body.get('source_file') or 'uploaded file',
+                _source_text(body), body.get('source_format', ''), slide_name,
+                body.get('source_file') or body.get('server_path') or 'uploaded file',
                 clip_negative=bool(body.get('clip_negative', False)),
                 converter='annotation_convert page (%s)' % converters.CONVERTER)
         except converters.AdapterError as exc:
@@ -399,6 +422,17 @@ class DsaCsvResource(Resource):
     )
     def annotation_example(self, params):
         return _json.loads(docs_page.example_json())
+
+    @access.user
+    @autoDescribeRoute(
+        Description('The server directories that annotation files may be read from by '
+                    'server_path (upload and convert). Configured with the '
+                    'DSA_ANNOTATION_SOURCE_ROOTS environment variable of the Girder '
+                    'container, colon-separated; default /data.')
+    )
+    def annotation_source_roots(self, params):
+        roots = server_files.source_roots()
+        return {'roots': roots, 'existing': [r for r in roots if os.path.isdir(r)]}
 
 # ---------------------------------------------------------------------------
 # HTML upload page (served at /csv_upload by the plugin __init__)
@@ -1271,8 +1305,11 @@ button{padding:9px 22px;border:none;border-radius:4px;font-size:.95em;cursor:poi
 
   <div class="card">
     <h2>3 &nbsp; Annotation JSON</h2>
-    <label for="jsonFile">Select JSON file</label>
+    <label for="jsonFile">File from this computer</label>
     <input id="jsonFile" type="file" accept=".json,application/json">
+    <label for="serverPath">&hellip;or a file already on the server</label>
+    <input id="serverPath" type="text" placeholder="/data/BEETLE/annotations/jsons/patient1_wsi1.dsa.json" autocomplete="off" spellcheck="false">
+    <p class="hint" id="rootsHint">A .json file as the Girder container sees it. If both are given, the server file is used.</p>
     <p class="hint">The file must use the DSA annotation format (<code>dsa-annotation</code> v1). Convert other formats first with <code>utils/convert_annotations.py</code>. Classes are checked against the collection&rsquo;s vocabulary when it has one.</p>
     <label class="chk"><input id="replace" type="checkbox"> Replace existing annotation layers of the same name</label>
   </div>
@@ -1338,6 +1375,21 @@ button{padding:9px 22px;border:none;border-radius:4px;font-size:.95em;cursor:poi
   }
   showSession(document.getElementById('apiUrl').value);
 
+  (async function showRoots() {
+    var token = sessionToken();
+    if (!token) return;
+    try {
+      var r = await fetch(document.getElementById('apiUrl').value + '/dsa_tools/annotation_source_roots',
+                          {headers: {'Girder-Token': token}});
+      if (!r.ok) return;
+      var d = await r.json();
+      document.getElementById('rootsHint').textContent =
+        'Server files can be read from: ' + d.roots.join(', ') +
+        ' (paths as the Girder container sees them; /mnt/raidData/BEETLE on the server is /data/BEETLE here). ' +
+        'If both are given, the server file is used.';
+    } catch (e) {}
+  })();
+
   window.lookupItem = async function() {
     var apiUrl = document.getElementById('apiUrl').value.trim();
     var apiKey = document.getElementById('apiKey').value.trim();
@@ -1371,8 +1423,9 @@ button{padding:9px 22px;border:none;border-radius:4px;font-size:.95em;cursor:poi
     var itemId  = document.getElementById('itemId').value.trim();
     var replace = document.getElementById('replace').checked;
     var file    = document.getElementById('jsonFile').files[0];
+    var serverPath = document.getElementById('serverPath').value.trim();
     if (!itemId) { alert('Item ID required.'); return; }
-    if (!file)   { alert('Select a JSON file.'); return; }
+    if (!file && !serverPath) { alert('Choose a file, or enter the path of a file on the server.'); return; }
 
     var status = document.getElementById('status');
     setBusy(true);
@@ -1382,8 +1435,9 @@ button{padding:9px 22px;border:none;border-radius:4px;font-size:.95em;cursor:poi
       var r = await fetch(apiUrl + '/dsa_tools/item/' + itemId + '/ingest_annotation_json', {
         method: 'POST',
         headers: {'Content-Type':'application/json','Girder-Token':token},
-        body: JSON.stringify({json_content: await file.text(), replace: replace,
-                              validate_only: validateOnly}),
+        body: JSON.stringify(serverPath
+          ? {server_path: serverPath, replace: replace, validate_only: validateOnly}
+          : {json_content: await file.text(), replace: replace, validate_only: validateOnly}),
       });
       var data = await r.json();
       if (!r.ok) throw new Error(data.message || ('HTTP ' + r.status));
@@ -1574,8 +1628,11 @@ _CONVERT_HTML = """<!DOCTYPE html>
   <div class="card">
     <label for="sourceFormat">Source format</label>
     <select id="sourceFormat"><!--FORMAT_OPTIONS--></select>
-    <label for="sourceFile">Source file</label>
+    <label for="sourceFile">Source file from this computer</label>
     <input id="sourceFile" type="file" accept=".json,application/json">
+    <label for="serverPath">&hellip;or a file already on the server</label>
+    <input id="serverPath" type="text" placeholder="/data/BEETLE/annotations/jsons/patient1_wsi1.json" autocomplete="off" spellcheck="false">
+    <p class="hint" id="rootsHint">A .json file as the Girder container sees it. If both are given, the server file is used.</p>
     <label for="slideName">Slide file these annotations belong to</label>
     <input id="slideName" type="text" placeholder="patient1_wsi1.tif" autocomplete="off">
     <p class="hint">Filled in from the source file&rsquo;s name; fix the extension if the slide is not a .tif.</p>
@@ -1635,6 +1692,26 @@ _CONVERT_HTML = """<!DOCTYPE html>
   }
   showSession();
 
+  (async function showRoots() {
+    var token = sessionToken();
+    if (!token) return;
+    try {
+      var r = await fetch(apiUrl + '/dsa_tools/annotation_source_roots', {headers: {'Girder-Token': token}});
+      if (!r.ok) return;
+      var d = await r.json();
+      document.getElementById('rootsHint').textContent =
+        'Server files can be read from: ' + d.roots.join(', ') +
+        ' (paths as the Girder container sees them; /mnt/raidData/BEETLE on the server is /data/BEETLE here). ' +
+        'If both are given, the server file is used.';
+    } catch (e) {}
+  })();
+
+  document.getElementById('serverPath').addEventListener('input', function () {
+    var name = document.getElementById('slideName');
+    var base = this.value.trim().split('/').pop();
+    if (base && !name.value) name.value = base.replace(/\\.json$/i, '') + '.tif';
+  });
+
   document.getElementById('sourceFile').addEventListener('change', function () {
     var f = this.files[0];
     var name = document.getElementById('slideName');
@@ -1662,10 +1739,57 @@ _CONVERT_HTML = """<!DOCTYPE html>
     setTimeout(function(){ URL.revokeObjectURL(a.href); }, 1000);
   };
 
+  function issueList(issues) {
+    return '<ul style="margin:8px 0 0 18px;font-size:.88em">' + issues.map(function(i) {
+      return '<li><code>' + esc(i.code) + '</code> ' + esc(i.message) + '</li>';
+    }).join('') + '</ul>';
+  }
+
+  window.attachConverted = async function (validateOnly) {
+    if (!converted) return;
+    var itemId = document.getElementById('itemId').value.trim();
+    var out = document.getElementById('attachResult');
+    var status = document.getElementById('attachStatus');
+    if (!itemId) { alert('Enter the item ID of the slide.'); return; }
+    status.textContent = validateOnly ? 'Validating\u2026' : 'Validating and uploading\u2026';
+    try {
+      var token = await getToken(document.getElementById('apiKey').value.trim());
+      var r = await fetch(apiUrl + '/dsa_tools/item/' + itemId + '/ingest_annotation_json', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json','Girder-Token':token},
+        body: JSON.stringify({json_content: JSON.stringify(converted.document),
+                              replace: document.getElementById('replace').checked,
+                              validate_only: validateOnly}),
+      });
+      var data = await r.json();
+      if (!r.ok) throw new Error(data.message || ('HTTP ' + r.status));
+      var html;
+      if (!data.ok) {
+        html = '<div class="err"><strong>' + plural(data.errors.length, 'problem') + ' found. Nothing was uploaded.</strong>' + issueList(data.errors) + '</div>';
+      } else if (data.validate_only) {
+        html = '<div class="ok"><strong>Valid. Uploading would create ' + plural(data.layers.length, 'layer') + ' on ' + esc(data.item_name) + '.</strong></div>';
+      } else {
+        html = '<div class="ok"><strong>' + plural(data.annotations_created.length, 'layer') + ' attached to ' + esc(data.item_name) + '.</strong>' +
+               (data.skipped_existing.length ? '<p class="note">Kept existing layers (tick Replace to overwrite): ' + data.skipped_existing.map(esc).join(', ') + '</p>' : '') +
+               '<p><a href="/histomics#?image=' + encodeURIComponent(itemId) + '" target="_blank" rel="noopener">Open in HistomicsUI &rarr;</a>' +
+               ' <span class="note">New layers start hidden: tick them in the Annotations panel.</span></p></div>';
+      }
+      if (data.warnings && data.warnings.length) {
+        html += '<div class="note" style="margin-top:8px"><strong>' + plural(data.warnings.length, 'warning') + '</strong>' + issueList(data.warnings) + '</div>';
+      }
+      out.innerHTML = html;
+    } catch (e) {
+      out.innerHTML = '<div class="err"><strong>Request failed:</strong> ' + esc(e.message) + '</div>';
+    } finally {
+      status.textContent = '';
+    }
+  };
+
   window.convert = async function () {
     var file = document.getElementById('sourceFile').files[0];
+    var serverPath = document.getElementById('serverPath').value.trim();
     var slideName = document.getElementById('slideName').value.trim();
-    if (!file) { alert('Choose a source file.'); return; }
+    if (!file && !serverPath) { alert('Choose a source file, or enter the path of a file on the server.'); return; }
     if (!slideName) { alert('Enter the slide filename these annotations belong to.'); return; }
     var btn = document.getElementById('convertBtn');
     var status = document.getElementById('status');
@@ -1675,13 +1799,12 @@ _CONVERT_HTML = """<!DOCTYPE html>
       var r = await fetch(apiUrl + '/dsa_tools/convert_annotation', {
         method: 'POST',
         headers: {'Content-Type':'application/json','Girder-Token':token},
-        body: JSON.stringify({
+        body: JSON.stringify(Object.assign({
           source_format: document.getElementById('sourceFormat').value,
-          json_content: await file.text(),
           slide_name: slideName,
-          source_file: file.name,
           clip_negative: document.getElementById('clipNegative').checked,
-        }),
+        }, serverPath ? {server_path: serverPath}
+                      : {json_content: await file.text(), source_file: file.name})),
       });
       var data = await r.json();
       if (!r.ok) throw new Error(data.message || ('HTTP ' + r.status));
@@ -1700,8 +1823,18 @@ _CONVERT_HTML = """<!DOCTYPE html>
       if (n.clipped) extra.push(plural(n.clipped, 'negative coordinate') + ' clamped to 0');
       if (extra.length) html += '<p class="note">' + esc(extra.join('; ')) + '.</p>';
       html += '<br><div class="actions"><button class="btn-primary" type="button" onclick="downloadConverted()">Download ' +
-              esc(data.suggested_filename) + '</button>' +
-              '<a href="/annotation_upload">Then upload it to a slide &rarr;</a></div></div>';
+              esc(data.suggested_filename) + '</button></div></div>';
+      html += '<div class="card" style="margin-top:14px;box-shadow:none;border:1px solid #e5e8ec">' +
+              '<h2>Attach to a slide now</h2>' +
+              '<p class="note">Validates against the slide and its collection vocabulary, then creates one layer per class. Nothing leaves the server.</p>' +
+              '<label for="itemId">Item ID of the slide</label>' +
+              '<input id="itemId" type="text" placeholder="6a94d466e756a09a3859e1ef" autocomplete="off" spellcheck="false">' +
+              '<label class="chk"><input id="replace" type="checkbox"> Replace existing layers of the same name</label>' +
+              '<div class="actions" style="margin-top:12px">' +
+              '<button class="btn-primary" type="button" onclick="attachConverted(true)">Validate only</button>' +
+              '<button class="btn-primary" type="button" onclick="attachConverted(false)">Validate &amp; upload</button>' +
+              '<span id="attachStatus" class="status" aria-live="polite"></span></div>' +
+              '<div id="attachResult" style="margin-top:12px"></div></div>';
       show(html);
     } catch (e) {
       converted = null;
